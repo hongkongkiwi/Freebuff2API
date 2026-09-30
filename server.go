@@ -104,6 +104,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
+	mux.HandleFunc("/v1/responses", s.handleResponses)
 	mux.HandleFunc("/v1/messages", s.handleClaudeMessages)
 	mux.HandleFunc("/v1/messages/count_tokens", s.handleClaudeCountTokens)
 	return s.withMiddleware(mux)
@@ -283,6 +284,61 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			return s.writeOpenAISuccess(w, resp, clientStream)
 		},
 	)
+}
+
+func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error", "")
+		return
+	}
+
+	requestBody, ok := readOpenAIBody(w, r)
+	if !ok {
+		return
+	}
+
+	payload, requestedModel, clientStream, err := convertResponsesRequestToChat(requestBody)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
+		return
+	}
+	if requestedModel == "" {
+		requestedModel = s.registry.DefaultModel()
+	}
+
+	s.proxyChatRequest(
+		w,
+		r,
+		payload,
+		requestedModel,
+		"invalid_request_error",
+		"server_error",
+		writeOpenAIError,
+		writePassthroughError,
+		func(w http.ResponseWriter, resp *http.Response) error {
+			return s.writeResponsesSuccess(w, resp, requestedModel, clientStream)
+		},
+	)
+}
+
+// writeResponsesSuccess serves a Responses API reply converted from the forced
+// upstream chat-completions stream.
+func (s *Server) writeResponsesSuccess(w http.ResponseWriter, resp *http.Response, requestedModel string, clientStream bool) error {
+	if clientStream {
+		return writeResponsesStreamingResponse(w, resp, requestedModel)
+	}
+	final, err := reassembleOpenAIStreamResponse(resp.Body, s.cfg.ToolCamouflage)
+	if err != nil {
+		return err
+	}
+	out, err := json.Marshal(convertChatCompletionToResponses(final))
+	if err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	_, err = w.Write(out)
+	return err
 }
 
 func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
