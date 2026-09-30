@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,19 @@ import (
 	"strings"
 	"time"
 )
+
+// defaultMaxRequestBodyBytes caps client request bodies unless
+// MAX_REQUEST_BODY_MB is configured.
+const defaultMaxRequestBodyBytes = 32 << 20
+
+// passthroughHeaders is the allowlist of upstream response headers copied to
+// clients. Everything else (set-cookie, server, cf-*, ...) is dropped.
+var passthroughHeaders = map[string]bool{
+	"Content-Type":  true,
+	"Cache-Control": true,
+	"Retry-After":   true,
+	"X-Request-Id":  true,
+}
 
 type Server struct {
 	cfg      Config
@@ -64,27 +78,76 @@ func (s *Server) withMiddleware(next http.Handler) http.Handler {
 			}
 			return
 		}
+		if r.Method == http.MethodPost && r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, s.maxBodyBytes())
+		}
 		next.ServeHTTP(w, r)
 	})
 }
 
+func (s *Server) maxBodyBytes() int64 {
+	if s.cfg.MaxRequestBodyMB > 0 {
+		return int64(s.cfg.MaxRequestBodyMB) * 1024 * 1024
+	}
+	return defaultMaxRequestBodyBytes
+}
+
+func isBodyTooLarge(err error) bool {
+	var maxBytesErr *http.MaxBytesError
+	return errors.As(err, &maxBytesErr)
+}
+
+func readOpenAIBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	requestBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		if isBodyTooLarge(err) {
+			writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request body too large", "invalid_request_error", "")
+		} else {
+			writeOpenAIError(w, http.StatusBadRequest, "failed to read request body", "invalid_request_error", "")
+		}
+		return nil, false
+	}
+	return requestBody, true
+}
+
+func readClaudeBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	requestBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		if isBodyTooLarge(err) {
+			writeClaudeError(w, http.StatusRequestEntityTooLarge, "request body too large", "invalid_request_error")
+		} else {
+			writeClaudeError(w, http.StatusBadRequest, "failed to read request body", "invalid_request_error")
+		}
+		return nil, false
+	}
+	return requestBody, true
+}
+
 func (s *Server) authorized(r *http.Request) bool {
-	if apiKey := strings.TrimSpace(r.Header.Get("x-api-key")); apiKey != "" {
-		if containsString(s.cfg.APIKeys, apiKey) {
-			return true
+	provided := strings.TrimSpace(r.Header.Get("x-api-key"))
+	if provided == "" {
+		authorization := strings.TrimSpace(r.Header.Get("Authorization"))
+		const prefix = "Bearer "
+		if strings.HasPrefix(authorization, prefix) {
+			provided = strings.TrimSpace(strings.TrimPrefix(authorization, prefix))
 		}
 	}
+	if provided == "" {
+		return false
+	}
+	return containsKeyConstantTime(s.cfg.APIKeys, provided)
+}
 
-	authorization := strings.TrimSpace(r.Header.Get("Authorization"))
-	if authorization == "" {
-		return false
+// containsKeyConstantTime compares the provided key against every configured
+// key in constant time so response latency does not leak which prefix matched.
+func containsKeyConstantTime(keys []string, provided string) bool {
+	var matched bool
+	for _, key := range keys {
+		if subtle.ConstantTimeCompare([]byte(key), []byte(provided)) == 1 {
+			matched = true
+		}
 	}
-	const prefix = "Bearer "
-	if !strings.HasPrefix(authorization, prefix) {
-		return false
-	}
-	apiKey := strings.TrimSpace(strings.TrimPrefix(authorization, prefix))
-	return containsString(s.cfg.APIKeys, apiKey)
+	return matched
 }
 
 func isClaudeRequestPath(path string) bool {
@@ -138,9 +201,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	requestBody, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "failed to read request body", "invalid_request_error", "")
+	requestBody, ok := readOpenAIBody(w, r)
+	if !ok {
 		return
 	}
 
@@ -176,9 +238,8 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	requestBody, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeClaudeError(w, http.StatusBadRequest, "failed to read request body", "invalid_request_error")
+	requestBody, ok := readClaudeBody(w, r)
+	if !ok {
 		return
 	}
 
@@ -216,9 +277,8 @@ func (s *Server) handleClaudeCountTokens(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	requestBody, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeClaudeError(w, http.StatusBadRequest, "failed to read request body", "invalid_request_error")
+	requestBody, ok := readClaudeBody(w, r)
+	if !ok {
 		return
 	}
 
@@ -687,7 +747,7 @@ func cloneSlice(input []any) []any {
 
 func copyHeaders(dst, src http.Header) {
 	for key, values := range src {
-		if strings.EqualFold(key, "Content-Length") {
+		if !passthroughHeaders[http.CanonicalHeaderKey(key)] {
 			continue
 		}
 		dst.Del(key)
@@ -796,11 +856,4 @@ func writeJSON(w http.ResponseWriter, statusCode int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	_, _ = w.Write(body)
-}
-
-func maxDuration(a, b time.Duration) time.Duration {
-	if a > b {
-		return a
-	}
-	return b
 }

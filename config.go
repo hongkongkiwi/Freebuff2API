@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -21,6 +22,7 @@ type Config struct {
 	UserAgent        string
 	APIKeys          []string
 	HTTPProxy        string
+	MaxRequestBodyMB int
 }
 
 type rawConfig struct {
@@ -31,6 +33,7 @@ type rawConfig struct {
 	RequestTimeout   string   `json:"REQUEST_TIMEOUT"`
 	APIKeys          []string `json:"API_KEYS"`
 	HTTPProxy        string   `json:"HTTP_PROXY"`
+	MaxRequestBodyMB int      `json:"MAX_REQUEST_BODY_MB"`
 }
 
 func loadConfig(configPath string) (Config, error) {
@@ -46,6 +49,7 @@ func loadConfig(configPath string) (Config, error) {
 	overrideCSV(&cfg.AuthTokens, "AUTH_TOKENS")
 	overrideCSV(&cfg.APIKeys, "API_KEYS")
 	overrideString(&cfg.HTTPProxy, "HTTP_PROXY")
+	overrideInt(&cfg.MaxRequestBodyMB, "MAX_REQUEST_BODY_MB")
 
 	rotationInterval, err := time.ParseDuration(strings.TrimSpace(cfg.RotationInterval))
 	if err != nil {
@@ -66,6 +70,7 @@ func loadConfig(configPath string) (Config, error) {
 		UserAgent:        generateUserAgent(),
 		APIKeys:          dedupeStrings(cfg.APIKeys),
 		HTTPProxy:        strings.TrimSpace(cfg.HTTPProxy),
+		MaxRequestBodyMB: cfg.MaxRequestBodyMB,
 	}
 
 	switch {
@@ -131,6 +136,18 @@ func overrideString(target *string, envName string) {
 	if value := strings.TrimSpace(os.Getenv(envName)); value != "" {
 		*target = value
 	}
+}
+
+func overrideInt(target *int, envName string) {
+	value := strings.TrimSpace(os.Getenv(envName))
+	if value == "" {
+		return
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 {
+		return
+	}
+	*target = parsed
 }
 
 func overrideCSV(target *[]string, envName string) {

@@ -8,9 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
-	"time"
 )
 
 type UpstreamClient struct {
@@ -142,15 +140,4 @@ func (c *UpstreamClient) doJSON(ctx context.Context, authToken, path string, bod
 		return nil, fmt.Errorf("send upstream request: %w", err)
 	}
 	return resp, nil
-}
-
-func retryAfterDuration(headerValue string) time.Duration {
-	headerValue = strings.TrimSpace(headerValue)
-	if headerValue == "" {
-		return 0
-	}
-	if seconds, err := strconv.Atoi(headerValue); err == nil && seconds > 0 {
-		return time.Duration(seconds) * time.Second
-	}
-	return 0
 }

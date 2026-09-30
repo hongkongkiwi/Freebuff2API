@@ -191,15 +191,6 @@ func (p *tokenPool) invalidateSession(reason string) {
 	}
 }
 
-func (p *tokenPool) currentSessionInstanceID() string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.session == nil {
-		return ""
-	}
-	return p.session.instanceID
-}
-
 func waitingRoomErrorFromSession(token string, session *cachedSession, now time.Time) *waitingRoomError {
 	if session == nil || session.status != sessionStatusQueued {
 		return nil
@@ -397,18 +388,4 @@ func parseOptionalTime(value string) (time.Time, error) {
 		return time.Time{}, nil
 	}
 	return time.Parse(time.RFC3339, value)
-}
-
-func sleepWithContext(ctx context.Context, delay time.Duration) error {
-	if delay <= 0 {
-		return nil
-	}
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }
