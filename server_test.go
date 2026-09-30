@@ -20,6 +20,7 @@ type upstreamStub struct {
 	chatStatus     int
 	chatResponse   string
 	queuedPost     bool
+	plainJSON      bool
 }
 
 func newUpstreamStub() *upstreamStub {
@@ -67,6 +68,14 @@ func (s *upstreamStub) handler() http.Handler {
 
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(status)
+		s.mu.Lock()
+		plain := s.plainJSON
+		s.mu.Unlock()
+		if plain {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-plain","object":"chat.completion","created":1700000000,"model":"minimax/minimax-m3","choices":[{"index":0,"message":{"role":"assistant","content":"plain json reply","tool_calls":[{"id":"call_p","type":"function","function":{"name":"mcp__bash","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}`))
+			return
+		}
 		if payload != "" {
 			_, _ = w.Write([]byte(payload))
 			return
@@ -89,6 +98,10 @@ func (s *upstreamStub) lastChatBody(t *testing.T) map[string]any {
 }
 
 func newTestServer(t *testing.T, stub *upstreamStub, upstreamURL string) *Server {
+	return newTestServerWithConfig(t, stub, upstreamURL, nil)
+}
+
+func newTestServerWithConfig(t *testing.T, stub *upstreamStub, upstreamURL string, mutate func(*Config)) *Server {
 	t.Helper()
 	cfg := Config{
 		ListenAddr:          ":0",
@@ -102,6 +115,9 @@ func newTestServer(t *testing.T, stub *upstreamStub, upstreamURL string) *Server
 		ToolCamouflage:      true,
 		HarnessRewrites:     true,
 		BuffyGuard:          true,
+	}
+	if mutate != nil {
+		mutate(&cfg)
 	}
 	registry := NewModelRegistry(nil, discardLogger())
 	registry.loadFallback()
@@ -321,5 +337,211 @@ func TestServerBodyTooLarge(t *testing.T) {
 
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d, want 413", rec.Code)
+	}
+}
+
+func TestServerStreamingFrameSeparation(t *testing.T) {
+	stub := newUpstreamStub()
+	upstream := httptest.NewServer(stub.handler())
+	defer upstream.Close()
+
+	server := newTestServer(t, stub, upstream.URL)
+
+	rec := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"minimax/minimax-m3","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Authorization", "Bearer sk-test-client")
+	server.Handler().ServeHTTP(rec, request)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("content type = %q", ct)
+	}
+
+	// SSE events must be blank-line separated; the relay must not glue all
+	// data lines into a single event.
+	frames := strings.Split(strings.TrimSuffix(rec.Body.String(), "\n\n"), "\n\n")
+	dataFrames := 0
+	sawDone := false
+	for _, frame := range frames {
+		if !strings.HasPrefix(frame, "data: ") {
+			t.Fatalf("malformed frame %q", frame)
+		}
+		dataFrames++
+		if strings.TrimPrefix(frame, "data: ") == "[DONE]" {
+			sawDone = true
+		}
+	}
+	if dataFrames < 2 {
+		t.Fatalf("only %d SSE frames, want content frame + [DONE]; body:\n%s", dataFrames, rec.Body.String())
+	}
+	if !sawDone {
+		t.Fatalf("[DONE] frame missing from relayed stream")
+	}
+	if !strings.Contains(rec.Body.String(), "hello from stub") {
+		t.Fatalf("content delta missing from stream: %s", rec.Body.String())
+	}
+}
+
+func TestServerNonStreamForceOff(t *testing.T) {
+	cases := []struct {
+		name       string
+		path       string
+		body       string
+		expectType string
+		check      func(t *testing.T, body []byte)
+	}{
+		{
+			name:       "openai passthrough strips camouflage",
+			path:       "/v1/chat/completions",
+			body:       `{"model":"minimax/minimax-m3","messages":[{"role":"user","content":"hi"}]}`,
+			expectType: "chat.completion",
+			check: func(t *testing.T, body []byte) {
+				var completion map[string]any
+				if err := json.Unmarshal(body, &completion); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				choice := completion["choices"].([]any)[0].(map[string]any)
+				message := choice["message"].(map[string]any)
+				calls := message["tool_calls"].([]any)
+				fn := calls[0].(map[string]any)["function"].(map[string]any)
+				if fn["name"] != "bash" {
+					t.Fatalf("tool name = %v, want camouflage stripped", fn["name"])
+				}
+				if message["content"] != "plain json reply" {
+					t.Fatalf("content = %v", message["content"])
+				}
+			},
+		},
+		{
+			name:       "claude conversion of plain json",
+			path:       "/v1/messages",
+			body:       `{"model":"minimax/minimax-m3","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`,
+			expectType: "message",
+			check: func(t *testing.T, body []byte) {
+				var message map[string]any
+				if err := json.Unmarshal(body, &message); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if message["type"] != "message" {
+					t.Fatalf("type = %v", message["type"])
+				}
+				if message["stop_reason"] != "tool_use" {
+					t.Fatalf("stop_reason = %v, want tool_use", message["stop_reason"])
+				}
+				found := false
+				for _, block := range message["content"].([]any) {
+					if block.(map[string]any)["type"] == "tool_use" {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatalf("tool_use block missing: %v", message["content"])
+				}
+			},
+		},
+		{
+			name:       "responses conversion of plain json",
+			path:       "/v1/responses",
+			body:       `{"model":"minimax/minimax-m3","input":"hi"}`,
+			expectType: "response",
+			check: func(t *testing.T, body []byte) {
+				var response map[string]any
+				if err := json.Unmarshal(body, &response); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if response["object"] != "response" || response["status"] != "completed" {
+					t.Fatalf("response = %v", response)
+				}
+				output := response["output"].([]any)
+				if len(output) != 2 {
+					t.Fatalf("output = %v", output)
+				}
+				call := output[1].(map[string]any)
+				if call["type"] != "function_call" || call["name"] != "bash" {
+					t.Fatalf("function call = %v", call)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := newUpstreamStub()
+			stub.mu.Lock()
+			stub.plainJSON = true
+			stub.mu.Unlock()
+			upstream := httptest.NewServer(stub.handler())
+			defer upstream.Close()
+
+			server := newTestServerWithConfig(t, stub, upstream.URL, func(cfg *Config) {
+				cfg.ForceUpstreamStream = false
+			})
+
+			rec := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			request.Header.Set("Authorization", "Bearer sk-test-client")
+			server.Handler().ServeHTTP(rec, request)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+			}
+			tc.check(t, rec.Body.Bytes())
+		})
+	}
+}
+
+func TestProxyRetriesExhaustedWritesError(t *testing.T) {
+	stub := newUpstreamStub()
+	stub.mu.Lock()
+	stub.chatStatus = http.StatusConflict
+	stub.chatResponse = `{"error":"session_superseded"}`
+	stub.mu.Unlock()
+	upstream := httptest.NewServer(stub.handler())
+	defer upstream.Close()
+
+	server := newTestServer(t, stub, upstream.URL)
+
+	rec := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"minimax/minimax-m3","messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Authorization", "Bearer sk-test-client")
+	server.Handler().ServeHTTP(rec, request)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if strings.TrimSpace(rec.Body.String()) == "" {
+		t.Fatal("empty response body after retries exhausted")
+	}
+}
+
+func TestAuthorizedEitherHeader(t *testing.T) {
+	stub := newUpstreamStub()
+	upstream := httptest.NewServer(stub.handler())
+	defer upstream.Close()
+
+	server := newTestServer(t, stub, upstream.URL)
+
+	cases := []struct {
+		name    string
+		headers map[string]string
+		want    bool
+	}{
+		{"bearer only", map[string]string{"Authorization": "Bearer sk-test-client"}, true},
+		{"x-api-key only", map[string]string{"x-api-key": "sk-test-client"}, true},
+		{"wrong x-api-key must not shadow valid bearer", map[string]string{"x-api-key": "nope", "Authorization": "Bearer sk-test-client"}, true},
+		{"wrong bearer with valid x-api-key", map[string]string{"x-api-key": "sk-test-client", "Authorization": "Bearer nope"}, true},
+		{"both wrong", map[string]string{"x-api-key": "nope", "Authorization": "Bearer nope"}, false},
+		{"none", map[string]string{}, false},
+	}
+	for _, tc := range cases {
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		for key, value := range tc.headers {
+			request.Header.Set(key, value)
+		}
+		if got := server.authorized(request); got != tc.want {
+			t.Errorf("%s: authorized = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

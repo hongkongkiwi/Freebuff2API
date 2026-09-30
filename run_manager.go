@@ -175,11 +175,10 @@ func NewRunManager(cfg Config, client *UpstreamClient, logger *log.Logger) *RunM
 	}
 }
 
-func (m *RunManager) Start(ctx context.Context, agentIDs []string) {
-	// Pre-warm runs for all free agents in background.
-	// The server is already listening; if a request arrives before
-	// pre-warming finishes, acquire() will lazily create the run.
-	go m.prewarm(agentIDs)
+func (m *RunManager) Start(ctx context.Context) {
+	// Pre-warm the free session in the background; runs are created lazily
+	// per agent on first request.
+	go m.prewarm()
 
 	m.wg.Add(1)
 	go func() {
@@ -204,20 +203,16 @@ func (m *RunManager) Start(ctx context.Context, agentIDs []string) {
 	}()
 }
 
-func (m *RunManager) prewarm(agentIDs []string) {
+// prewarm establishes the free session for each pool. Runs are created
+// lazily per agent on first use — starting runs for the whole catalog (~80
+// agents) at startup would hammer the upstream with pointless calls.
+func (m *RunManager) prewarm() {
 	ctx, cancel := context.WithTimeout(context.Background(), m.cfg.RequestTimeout)
 	defer cancel()
 
 	for _, pool := range m.pools {
 		if _, err := pool.ensureSession(ctx); err != nil {
 			m.logger.Printf("%s: free session prewarm failed: %v", pool.name, err)
-		}
-		for _, agentID := range agentIDs {
-			if err := pool.rotateAgent(ctx, agentID); err != nil {
-				m.logger.Printf("%s: prewarm %s failed: %v", pool.name, agentID, err)
-			} else {
-				m.logger.Printf("%s: prewarmed %s", pool.name, agentID)
-			}
 		}
 	}
 }
@@ -344,6 +339,12 @@ func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, err
 }
 
 func (p *tokenPool) maintain(ctx context.Context) error {
+	// A cooling-down pool gets no maintenance traffic until the cooldown
+	// expires; the session is rebuilt on the next real request.
+	if p.coolingDown() {
+		return nil
+	}
+
 	if _, err := p.ensureSession(ctx); err != nil {
 		p.logger.Printf("%s: refresh free session failed: %v", p.name, err)
 	}
@@ -537,6 +538,12 @@ func (p *tokenPool) setHealth(health string) {
 	p.mu.Lock()
 	p.health = health
 	p.mu.Unlock()
+}
+
+func (p *tokenPool) coolingDown() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return time.Now().Before(p.cooldownUntil)
 }
 
 func (p *tokenPool) reportFailure(reason string) {

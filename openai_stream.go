@@ -175,7 +175,7 @@ var harnessPromptReplacements = [][2]string{
 }
 
 // rewriteHarnessPrompts applies the harness replacements to string content of
-// system messages only.
+// system messages, including text parts of array (multi-part) content.
 func rewriteHarnessPrompts(payload map[string]any) {
 	messages, ok := payload["messages"].([]any)
 	if !ok {
@@ -189,15 +189,28 @@ func rewriteHarnessPrompts(payload map[string]any) {
 		if stringValue(message["role"]) != "system" {
 			continue
 		}
-		content, ok := message["content"].(string)
-		if !ok {
-			continue
+		switch content := message["content"].(type) {
+		case string:
+			message["content"] = applyHarnessReplacements(content)
+		case []any:
+			for _, rawPart := range content {
+				part, ok := rawPart.(map[string]any)
+				if !ok {
+					continue
+				}
+				if text, ok := part["text"].(string); ok {
+					part["text"] = applyHarnessReplacements(text)
+				}
+			}
 		}
-		for _, pair := range harnessPromptReplacements {
-			content = strings.ReplaceAll(content, pair[0], pair[1])
-		}
-		message["content"] = content
 	}
+}
+
+func applyHarnessReplacements(content string) string {
+	for _, pair := range harnessPromptReplacements {
+		content = strings.ReplaceAll(content, pair[0], pair[1])
+	}
+	return content
 }
 
 // rewriteUpstreamChunk strips response-side camouflage from one SSE data
@@ -518,11 +531,14 @@ func writeOpenAIStreamingResponse(w http.ResponseWriter, resp *http.Response, st
 					}
 					payloadCount++
 
-					out := line
+					// Re-frame each payload with proper SSE delimiters: the
+					// raw upstream line carries a single newline, but events
+					// must be separated by a blank line.
+					out := append([]byte("data: "), payload...)
 					if stripCamouflage {
 						out = append([]byte("data: "), rewriteUpstreamChunk(payload)...)
-						out = append(out, '\n', '\n')
 					}
+					out = append(out, '\n', '\n')
 					if _, writeErr := w.Write(out); writeErr != nil {
 						return writeErr
 					}

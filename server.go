@@ -124,7 +124,7 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) Start(ctx context.Context) {
-	s.runs.Start(ctx, s.registry.AgentIDs())
+	s.runs.Start(ctx)
 }
 
 func (s *Server) Shutdown(ctx context.Context) {
@@ -187,18 +187,18 @@ func readClaudeBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 }
 
 func (s *Server) authorized(r *http.Request) bool {
-	provided := strings.TrimSpace(r.Header.Get("x-api-key"))
-	if provided == "" {
-		authorization := strings.TrimSpace(r.Header.Get("Authorization"))
-		const prefix = "Bearer "
-		if strings.HasPrefix(authorization, prefix) {
-			provided = strings.TrimSpace(strings.TrimPrefix(authorization, prefix))
-		}
+	// Either header may authenticate; a wrong x-api-key must not shadow a
+	// valid Bearer token.
+	if provided := strings.TrimSpace(r.Header.Get("x-api-key")); provided != "" && containsKeyConstantTime(s.cfg.APIKeys, provided) {
+		return true
 	}
-	if provided == "" {
+	authorization := strings.TrimSpace(r.Header.Get("Authorization"))
+	const prefix = "Bearer "
+	if !strings.HasPrefix(authorization, prefix) {
 		return false
 	}
-	return containsKeyConstantTime(s.cfg.APIKeys, provided)
+	provided := strings.TrimSpace(strings.TrimPrefix(authorization, prefix))
+	return provided != "" && containsKeyConstantTime(s.cfg.APIKeys, provided)
 }
 
 // containsKeyConstantTime compares the provided key against every configured
@@ -334,11 +334,25 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
-// writeResponsesSuccess serves a Responses API reply converted from the forced
-// upstream chat-completions stream.
+// writeResponsesSuccess serves a Responses API reply converted from the
+// upstream chat-completions stream (or plain JSON when stream forcing is off).
 func (s *Server) writeResponsesSuccess(w http.ResponseWriter, resp *http.Response, requestedModel string, clientStream bool) error {
 	if clientStream {
 		return writeResponsesStreamingResponse(w, resp, requestedModel)
+	}
+	if !s.cfg.ForceUpstreamStream {
+		completion, err := readUpstreamJSONCompletion(resp)
+		if err != nil {
+			return err
+		}
+		out, err := json.Marshal(convertChatCompletionToResponses(completion))
+		if err != nil {
+			return err
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		_, err = w.Write(out)
+		return err
 	}
 	final, err := reassembleOpenAIStreamResponse(resp.Body, s.cfg.ToolCamouflage)
 	if err != nil {
@@ -606,15 +620,34 @@ func (s *Server) proxyChatRequest(
 		return
 	}
 
-	surfaceUpstreamError()
+	// Attempts exhausted by session/run-invalid retries with no upstream
+	// error recorded; without this the client would get an empty response.
+	if !surfaceUpstreamError() {
+		writeError(w, http.StatusBadGateway, "upstream retries exhausted", serverErrorType, "")
+	}
 }
 
 // writeOpenAISuccess serves a chat completion: streaming clients get the SSE
-// relay (with camouflage stripped per chunk), non-streaming clients get a
-// response reassembled from the forced upstream stream.
+// relay (with camouflage stripped per chunk); non-streaming clients get a
+// reassembled response when the upstream was forced to stream, or the plain
+// upstream JSON (camouflage-stripped) otherwise.
 func (s *Server) writeOpenAISuccess(w http.ResponseWriter, resp *http.Response, clientStream bool) error {
 	if clientStream {
 		return writeOpenAIStreamingResponse(w, resp, s.cfg.ToolCamouflage)
+	}
+	if !s.cfg.ForceUpstreamStream {
+		completion, err := readUpstreamJSONCompletion(resp)
+		if err != nil {
+			return err
+		}
+		body, err := json.Marshal(completion)
+		if err != nil {
+			return err
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		_, err = w.Write(body)
+		return err
 	}
 	final, err := reassembleOpenAIStreamResponse(resp.Body, s.cfg.ToolCamouflage)
 	if err != nil {
@@ -630,11 +663,29 @@ func (s *Server) writeOpenAISuccess(w http.ResponseWriter, resp *http.Response, 
 	return err
 }
 
+// readUpstreamJSONCompletion reads a plain chat.completion JSON body, stripping
+// tool camouflage when enabled so wire names never reach clients.
+func readUpstreamJSONCompletion(resp *http.Response) (map[string]any, error) {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var completion map[string]any
+	if err := json.Unmarshal(body, &completion); err != nil {
+		return nil, fmt.Errorf("decode upstream response: %w", err)
+	}
+	stripCamouflageFromPayload(completion)
+	return completion, nil
+}
+
 // writeClaudeSuccess serves a Claude Messages response converted from the
-// forced upstream OpenAI stream.
+// upstream OpenAI stream (or plain JSON when stream forcing is off).
 func (s *Server) writeClaudeSuccess(w http.ResponseWriter, resp *http.Response, requestedModel string, clientStream bool) error {
 	if clientStream {
 		return writeClaudeStreamingResponse(w, resp, requestedModel)
+	}
+	if !s.cfg.ForceUpstreamStream {
+		return writeClaudeNonStreamResponse(w, resp)
 	}
 	final, err := reassembleOpenAIStreamResponse(resp.Body, false)
 	if err != nil {
