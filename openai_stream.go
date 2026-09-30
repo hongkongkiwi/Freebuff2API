@@ -107,6 +107,65 @@ func camouflageToolsForUpstream(payload map[string]any) {
 // calls and strips wire-name prefixes so clients only ever see their own tool
 // names. Applies to both message.tool_calls and delta.tool_calls.
 func stripCamouflageFromPayload(payload map[string]any) {
+	stripCamouflageFromPayloadCtx(payload, camouflageCtx{strip: true})
+}
+
+// camouflageCtx carries the response-side stripping configuration for one
+// request: whether stripping is enabled, which wire names belong to client
+// tools that were natively mcp__-prefixed (never renamed upstream, so their
+// responses must pass through unstripped), and whether reasoning-only output
+// should be promoted into plain text (OpenAI dialects; the Claude dialect
+// keeps reasoning as thinking blocks).
+type camouflageCtx struct {
+	strip   bool
+	promote bool
+	exempt  map[string]bool
+}
+
+var noCamouflage = camouflageCtx{}
+
+// clientToolName maps a wire tool name to its client-facing form; keep=false
+// drops the call entirely (signature tool only).
+func (c camouflageCtx) clientToolName(wire string) (name string, keep bool) {
+	if !c.strip || c.exempt[wire] {
+		return wire, true
+	}
+	name = fromWireToolName(wire)
+	if isSignatureToolName(name) {
+		return "", false
+	}
+	return name, true
+}
+
+// nativeMcpToolNames collects client tool names that already carry the mcp__
+// prefix; those are sent verbatim, so their responses must not be stripped.
+func nativeMcpToolNames(payload map[string]any) map[string]bool {
+	tools, ok := payload["tools"].([]any)
+	if !ok {
+		return nil
+	}
+	var out map[string]bool
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		fn, ok := tool["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := fn["name"].(string)
+		if strings.HasPrefix(name, mcpToolPrefix) {
+			if out == nil {
+				out = make(map[string]bool)
+			}
+			out[name] = true
+		}
+	}
+	return out
+}
+
+func stripCamouflageFromPayloadCtx(payload map[string]any, cam camouflageCtx) {
 	choices, ok := payload["choices"].([]any)
 	if !ok {
 		return
@@ -138,10 +197,11 @@ func stripCamouflageFromPayload(payload map[string]any) {
 					continue
 				}
 				name, _ := fn["name"].(string)
-				if isSignatureToolName(name) {
+				clientName, keep := cam.clientToolName(name)
+				if !keep {
 					continue
 				}
-				fn["name"] = fromWireToolName(name)
+				fn["name"] = clientName
 				kept = append(kept, call)
 			}
 			if len(kept) == 0 {
@@ -151,6 +211,36 @@ func stripCamouflageFromPayload(payload map[string]any) {
 			}
 		}
 	}
+}
+
+// downgradeDecideOnlyFinish fixes whole-response objects where stripping
+// removed every tool call but the upstream reported a tool-calls finish
+// reason (the model only emitted decide bookkeeping calls).
+func downgradeDecideOnlyFinish(payload map[string]any) {
+	choices, ok := payload["choices"].([]any)
+	if !ok {
+		return
+	}
+	for _, rawChoice := range choices {
+		choice, ok := rawChoice.(map[string]any)
+		if !ok {
+			continue
+		}
+		if reason, _ := choice["finish_reason"].(string); reason == "tool_calls" && !choiceHasToolCalls(choice) {
+			choice["finish_reason"] = "stop"
+		}
+	}
+}
+
+func choiceHasToolCalls(choice map[string]any) bool {
+	for _, field := range []string{"message", "delta"} {
+		if container, ok := choice[field].(map[string]any); ok {
+			if calls, ok := container["tool_calls"].([]any); ok && len(calls) > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // forceUpstreamStreaming pins stream:true plus usage reporting on the upstream
@@ -416,9 +506,8 @@ func (a *chatCompletionAccumulator) finalize() map[string]any {
 			for _, toolIndex := range choice.toolOrder {
 				tool := choice.toolCalls[toolIndex]
 				calls = append(calls, map[string]any{
-					"index": toolIndex,
-					"id":    tool.id,
-					"type":  "function",
+					"id":   tool.id,
+					"type": "function",
 					"function": map[string]any{
 						"name":      tool.name,
 						"arguments": tool.arguments.String(),
@@ -487,6 +576,10 @@ func promoteBlankOpenAIContent(final map[string]any) {
 // reassembleOpenAIStreamResponse consumes a forced-stream upstream body and
 // builds the non-streaming chat.completion object a client asked for.
 func reassembleOpenAIStreamResponse(body io.Reader, stripCamouflage bool) (map[string]any, error) {
+	return reassembleOpenAIStreamResponseCtx(body, camouflageCtx{strip: stripCamouflage, promote: true})
+}
+
+func reassembleOpenAIStreamResponseCtx(body io.Reader, cam camouflageCtx) (map[string]any, error) {
 	acc := newChatCompletionAccumulator()
 	chunks, err := consumeOpenAIStream(body, func(payload []byte) error {
 		return acc.ingest(payload)
@@ -499,22 +592,48 @@ func reassembleOpenAIStreamResponse(body io.Reader, stripCamouflage bool) (map[s
 	}
 
 	final := acc.finalize()
-	if stripCamouflage {
-		stripCamouflageFromPayload(final)
+	stripCamouflageFromPayloadCtx(final, cam)
+	downgradeDecideOnlyFinish(final)
+	if cam.promote {
+		promoteBlankOpenAIContent(final)
 	}
-	promoteBlankOpenAIContent(final)
 	return final, nil
 }
 
 // writeOpenAIStreamingResponse relays the upstream SSE stream to a streaming
 // client, optionally rewriting tool camouflage per chunk. Response headers are
-// not committed until the first data payload arrives so a fully blank upstream
-// stream can still be retried.
+// not committed until the first real data payload arrives so a fully blank
+// upstream stream (including a lone [DONE]) can still be retried.
 func writeOpenAIStreamingResponse(w http.ResponseWriter, resp *http.Response, stripCamouflage bool) error {
+	return writeOpenAIStreamingResponseCtx(w, resp, camouflageCtx{strip: stripCamouflage})
+}
+
+func writeOpenAIStreamingResponseCtx(w http.ResponseWriter, resp *http.Response, cam camouflageCtx) error {
 	flusher, _ := w.(http.Flusher)
 	reader := bufio.NewReader(resp.Body)
 	committed := false
 	payloadCount := 0
+	sawToolCall := false
+
+	commitHeader := func() {
+		if !committed {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.WriteHeader(resp.StatusCode)
+			committed = true
+		}
+	}
+	writeFrame := func(data []byte) error {
+		out := append([]byte("data: "), data...)
+		out = append(out, '\n', '\n')
+		if _, err := w.Write(out); err != nil {
+			return err
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return nil
+	}
 
 	for {
 		line, err := reader.ReadBytes('\n')
@@ -523,27 +642,40 @@ func writeOpenAIStreamingResponse(w http.ResponseWriter, resp *http.Response, st
 			if len(trimmed) > 0 && !bytes.HasPrefix(trimmed, []byte(":")) && bytes.HasPrefix(trimmed, []byte("data:")) {
 				payload := bytes.TrimSpace(trimmed[5:])
 				if len(payload) > 0 {
-					if !committed {
-						w.Header().Set("Content-Type", "text/event-stream")
-						w.Header().Set("Cache-Control", "no-cache")
-						w.WriteHeader(resp.StatusCode)
-						committed = true
+					if bytes.Equal(payload, []byte("[DONE]")) {
+						// Nothing real was relayed yet: treat as blank so the
+						// caller can retry with a fresh session.
+						if !committed {
+							return errBlankUpstreamStream
+						}
+						if werr := writeFrame(payload); werr != nil {
+							return werr
+						}
+						continue
 					}
+					commitHeader()
 					payloadCount++
 
-					// Re-frame each payload with proper SSE delimiters: the
-					// raw upstream line carries a single newline, but events
-					// must be separated by a blank line.
-					out := append([]byte("data: "), payload...)
-					if stripCamouflage {
-						out = append([]byte("data: "), rewriteUpstreamChunk(payload)...)
+					out := payload
+					if cam.strip {
+						var chunk map[string]any
+						if json.Unmarshal(payload, &chunk) == nil {
+							stripCamouflageFromPayloadCtx(chunk, cam)
+							if chunkHasKeptToolCall(chunk) {
+								sawToolCall = true
+							}
+							// A finish chunk reporting tool_calls with no real
+							// tool call relayed (decide-only) must read as stop.
+							if !sawToolCall {
+								downgradeDecideOnlyFinish(chunk)
+							}
+							if re, mErr := json.Marshal(chunk); mErr == nil {
+								out = re
+							}
+						}
 					}
-					out = append(out, '\n', '\n')
-					if _, writeErr := w.Write(out); writeErr != nil {
-						return writeErr
-					}
-					if flusher != nil {
-						flusher.Flush()
+					if werr := writeFrame(out); werr != nil {
+						return werr
 					}
 				}
 			}
@@ -562,4 +694,23 @@ func writeOpenAIStreamingResponse(w http.ResponseWriter, resp *http.Response, st
 			return err
 		}
 	}
+}
+
+// chunkHasKeptToolCall reports whether any choice in the chunk still carries
+// tool calls after stripping.
+func chunkHasKeptToolCall(chunk map[string]any) bool {
+	choices, ok := chunk["choices"].([]any)
+	if !ok {
+		return false
+	}
+	for _, rawChoice := range choices {
+		choice, ok := rawChoice.(map[string]any)
+		if !ok {
+			continue
+		}
+		if choiceHasToolCalls(choice) {
+			return true
+		}
+	}
+	return false
 }

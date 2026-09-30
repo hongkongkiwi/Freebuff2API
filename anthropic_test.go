@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -167,5 +169,56 @@ func TestMapOpenAIFinishReasonToClaude(t *testing.T) {
 	}
 	if got := mapOpenAIFinishReasonToClaude("stop"); got != "end_turn" {
 		t.Fatalf("stop → %q", got)
+	}
+}
+
+func TestClaudeBlankDoneOnlyStreamIsRetryable(t *testing.T) {
+	rec := httptest.NewRecorder()
+	resp := &http.Response{StatusCode: http.StatusOK, Body: readCloserFromString("data: [DONE]\n\n")}
+	err := writeClaudeStreamingResponse(rec, resp, "test-model")
+	if err != errBlankUpstreamStream {
+		t.Fatalf("err = %v, want errBlankUpstreamStream for a [DONE]-only stream", err)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("bytes written for blank stream: %q", rec.Body.String())
+	}
+}
+
+func TestClaudeStreamPostFinishDeltaStaysWellFormed(t *testing.T) {
+	body := "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"done text\"},\"finish_reason\":null}]}\n\n" +
+		"data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		// Sloppy upstream: content delta after the finish chunk.
+		"data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"straggler\"},\"finish_reason\":null}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	rec := httptest.NewRecorder()
+	resp := &http.Response{StatusCode: http.StatusOK, Body: readCloserFromString(body)}
+	if err := writeClaudeStreamingResponse(rec, resp, "test-model"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	starts, stops := 0, 0
+	lastEvent := ""
+	for _, frame := range strings.Split(rec.Body.String(), "\n\n") {
+		if !strings.HasPrefix(frame, "event: ") {
+			continue
+		}
+		name := strings.TrimSpace(strings.TrimPrefix(strings.SplitN(frame, "\n", 2)[0], "event: "))
+		switch name {
+		case "content_block_start":
+			starts++
+		case "content_block_stop":
+			stops++
+		}
+		lastEvent = name
+	}
+	if starts != stops {
+		t.Fatalf("unbalanced blocks: %d starts vs %d stops\n%s", starts, stops, rec.Body.String())
+	}
+	if lastEvent != "message_stop" {
+		t.Fatalf("last event = %q, want message_stop", lastEvent)
+	}
+	if strings.Contains(rec.Body.String(), "straggler") {
+		t.Fatal("post-finish delta leaked into the terminal stream")
 	}
 }

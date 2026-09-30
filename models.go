@@ -272,9 +272,10 @@ func (r *ModelRegistry) Status() registryStatus {
 
 // ClampReasoningEffort narrows a client-requested reasoning effort to the
 // ladder the upstream catalog publishes for the model. Models with a fixed
-// effort pin always run at that pin; unknown models pass through unchanged.
+// effort pin always run at that pin (only an empty effort passes through
+// untouched); unknown models pass their effort through unchanged.
 func (r *ModelRegistry) ClampReasoningEffort(model, effort string) string {
-	if effort == "" || effort == "auto" || effort == "none" {
+	if effort == "" {
 		return effort
 	}
 
@@ -282,6 +283,9 @@ func (r *ModelRegistry) ClampReasoningEffort(model, effort string) string {
 	defer r.mu.RUnlock()
 	if pin, ok := r.modelEffortPin[model]; ok && pin != "" {
 		return pin
+	}
+	if effort == "auto" || effort == "none" {
+		return effort
 	}
 	ladder, ok := r.modelEfforts[model]
 	if !ok || len(ladder) == 0 {

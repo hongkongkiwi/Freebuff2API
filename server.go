@@ -283,6 +283,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	clientStream := boolValue(payload["stream"])
+	camCtx := s.requestCamouflageCtx(payload)
 
 	s.proxyChatRequest(
 		w,
@@ -294,7 +295,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError,
 		writePassthroughError,
 		func(w http.ResponseWriter, resp *http.Response) error {
-			return s.writeOpenAISuccess(w, resp, clientStream)
+			return s.writeOpenAISuccess(w, resp, clientStream, camCtx)
 		},
 	)
 }
@@ -319,6 +320,8 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		requestedModel = s.registry.DefaultModel()
 	}
 
+	camCtx := s.requestCamouflageCtx(payload)
+
 	s.proxyChatRequest(
 		w,
 		r,
@@ -329,19 +332,19 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError,
 		writePassthroughError,
 		func(w http.ResponseWriter, resp *http.Response) error {
-			return s.writeResponsesSuccess(w, resp, requestedModel, clientStream)
+			return s.writeResponsesSuccess(w, resp, requestedModel, clientStream, camCtx)
 		},
 	)
 }
 
 // writeResponsesSuccess serves a Responses API reply converted from the
 // upstream chat-completions stream (or plain JSON when stream forcing is off).
-func (s *Server) writeResponsesSuccess(w http.ResponseWriter, resp *http.Response, requestedModel string, clientStream bool) error {
+func (s *Server) writeResponsesSuccess(w http.ResponseWriter, resp *http.Response, requestedModel string, clientStream bool, cam camouflageCtx) error {
 	if clientStream {
-		return writeResponsesStreamingResponse(w, resp, requestedModel)
+		return writeResponsesStreamingResponseCtx(w, resp, requestedModel, cam)
 	}
 	if !s.cfg.ForceUpstreamStream {
-		completion, err := readUpstreamJSONCompletion(resp)
+		completion, err := readUpstreamJSONCompletion(resp, cam)
 		if err != nil {
 			return err
 		}
@@ -354,7 +357,8 @@ func (s *Server) writeResponsesSuccess(w http.ResponseWriter, resp *http.Respons
 		_, err = w.Write(out)
 		return err
 	}
-	final, err := reassembleOpenAIStreamResponse(resp.Body, s.cfg.ToolCamouflage)
+	cam.promote = true // Responses clients get reasoning promoted to text
+	final, err := reassembleOpenAIStreamResponseCtx(resp.Body, cam)
 	if err != nil {
 		return err
 	}
@@ -390,6 +394,8 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	camCtx := s.requestCamouflageCtx(payload)
+
 	s.proxyChatRequest(
 		w,
 		r,
@@ -402,7 +408,7 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 		},
 		writeClaudePassthroughError,
 		func(w http.ResponseWriter, resp *http.Response) error {
-			return s.writeClaudeSuccess(w, resp, requestedModel, stream)
+			return s.writeClaudeSuccess(w, resp, requestedModel, stream, camCtx)
 		},
 	)
 }
@@ -540,19 +546,30 @@ func (s *Server) proxyChatRequest(
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			s.runs.ReportSuccess(lease)
-			writeErr := writeSuccess(w, resp)
+			tracker := &responseTracker{ResponseWriter: w}
+			writeErr := writeSuccess(tracker, resp)
 			if closeErr := resp.Body.Close(); closeErr != nil {
 				s.logger.Printf("[%s] upstream body close failed: %v", lease.pool.name, closeErr)
 			}
 			slotRelease()
-			if errors.Is(writeErr, errBlankUpstreamStream) && attempt < maxProxyAttempts-1 {
-				s.logger.Printf("[%s] upstream returned a blank stream, refreshing session and retrying", lease.pool.name)
-				lease.pool.invalidateSession("blank upstream stream")
+
+			if writeErr != nil {
+				if errors.Is(writeErr, errBlankUpstreamStream) && attempt < maxProxyAttempts-1 {
+					s.logger.Printf("[%s] upstream returned a blank stream, refreshing session and retrying", lease.pool.name)
+					lease.pool.invalidateSession("blank upstream stream")
+					s.runs.Release(lease)
+					continue
+				}
+				if !tracker.committed {
+					// Nothing reached the client: surface the failure instead
+					// of leaving an implicit empty 200 response.
+					s.logger.Printf("[%s] upstream response processing failed before commit: %v", lease.pool.name, writeErr)
+					writeError(w, http.StatusBadGateway, fmt.Sprintf("upstream response processing failed: %v", writeErr), serverErrorType, "")
+				} else if !errors.Is(writeErr, context.Canceled) {
+					s.logger.Printf("[%s] proxy response copy failed after commit: %v", lease.pool.name, writeErr)
+				}
 				s.runs.Release(lease)
-				continue
-			}
-			if writeErr != nil && !errors.Is(writeErr, context.Canceled) {
-				s.logger.Printf("[%s] proxy response copy failed: %v", lease.pool.name, writeErr)
+				return
 			}
 			s.logger.Printf("[%s] Request completed in %v (status: %d)", lease.pool.name, time.Since(startTime).Round(time.Millisecond), resp.StatusCode)
 			s.runs.Release(lease)
@@ -591,6 +608,10 @@ func (s *Server) proxyChatRequest(
 			s.logger.Printf("%s: upstream rejected account (%s)", lease.pool.name, health)
 			if health == healthBanned || health == healthCountryBlock {
 				s.runs.Cooldown(lease, 24*time.Hour, "upstream rejected account: "+health)
+			} else {
+				// Unrecognized 403 (WAF page, new block shape): cool the pool
+				// briefly so round-robin stops feeding it traffic.
+				s.runs.Cooldown(lease, 5*time.Minute, "upstream rejected account: "+health)
 			}
 			slotRelease()
 			s.runs.Release(lease)
@@ -627,16 +648,21 @@ func (s *Server) proxyChatRequest(
 	}
 }
 
-// writeOpenAISuccess serves a chat completion: streaming clients get the SSE
+// requestCamouflageCtx builds the response-side stripping configuration for a
+// request: client tools that natively carry the mcp__ prefix are exempt from
+// stripping.
+func (s *Server) requestCamouflageCtx(payload map[string]any) camouflageCtx {
+	return camouflageCtx{strip: s.cfg.ToolCamouflage, exempt: nativeMcpToolNames(payload)}
+} // writeOpenAISuccess serves a chat completion: streaming clients get the SSE
 // relay (with camouflage stripped per chunk); non-streaming clients get a
 // reassembled response when the upstream was forced to stream, or the plain
 // upstream JSON (camouflage-stripped) otherwise.
-func (s *Server) writeOpenAISuccess(w http.ResponseWriter, resp *http.Response, clientStream bool) error {
+func (s *Server) writeOpenAISuccess(w http.ResponseWriter, resp *http.Response, clientStream bool, cam camouflageCtx) error {
 	if clientStream {
-		return writeOpenAIStreamingResponse(w, resp, s.cfg.ToolCamouflage)
+		return writeOpenAIStreamingResponseCtx(w, resp, cam)
 	}
 	if !s.cfg.ForceUpstreamStream {
-		completion, err := readUpstreamJSONCompletion(resp)
+		completion, err := readUpstreamJSONCompletion(resp, cam)
 		if err != nil {
 			return err
 		}
@@ -649,7 +675,8 @@ func (s *Server) writeOpenAISuccess(w http.ResponseWriter, resp *http.Response, 
 		_, err = w.Write(body)
 		return err
 	}
-	final, err := reassembleOpenAIStreamResponse(resp.Body, s.cfg.ToolCamouflage)
+	cam.promote = true // OpenAI clients get reasoning promoted to text
+	final, err := reassembleOpenAIStreamResponseCtx(resp.Body, cam)
 	if err != nil {
 		return err
 	}
@@ -665,7 +692,7 @@ func (s *Server) writeOpenAISuccess(w http.ResponseWriter, resp *http.Response, 
 
 // readUpstreamJSONCompletion reads a plain chat.completion JSON body, stripping
 // tool camouflage when enabled so wire names never reach clients.
-func readUpstreamJSONCompletion(resp *http.Response) (map[string]any, error) {
+func readUpstreamJSONCompletion(resp *http.Response, cam camouflageCtx) (map[string]any, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
@@ -674,20 +701,21 @@ func readUpstreamJSONCompletion(resp *http.Response) (map[string]any, error) {
 	if err := json.Unmarshal(body, &completion); err != nil {
 		return nil, fmt.Errorf("decode upstream response: %w", err)
 	}
-	stripCamouflageFromPayload(completion)
+	stripCamouflageFromPayloadCtx(completion, cam)
+	downgradeDecideOnlyFinish(completion)
 	return completion, nil
 }
 
 // writeClaudeSuccess serves a Claude Messages response converted from the
 // upstream OpenAI stream (or plain JSON when stream forcing is off).
-func (s *Server) writeClaudeSuccess(w http.ResponseWriter, resp *http.Response, requestedModel string, clientStream bool) error {
+func (s *Server) writeClaudeSuccess(w http.ResponseWriter, resp *http.Response, requestedModel string, clientStream bool, cam camouflageCtx) error {
 	if clientStream {
-		return writeClaudeStreamingResponse(w, resp, requestedModel)
+		return writeClaudeStreamingResponseCtx(w, resp, requestedModel, cam)
 	}
 	if !s.cfg.ForceUpstreamStream {
-		return writeClaudeNonStreamResponse(w, resp)
+		return writeClaudeNonStreamResponse(w, resp, cam)
 	}
-	final, err := reassembleOpenAIStreamResponse(resp.Body, false)
+	final, err := reassembleOpenAIStreamResponseCtx(resp.Body, noCamouflage)
 	if err != nil {
 		return err
 	}
@@ -695,7 +723,7 @@ func (s *Server) writeClaudeSuccess(w http.ResponseWriter, resp *http.Response, 
 	if err != nil {
 		return err
 	}
-	converted, err := convertOpenAINonStreamResponseToClaude(body)
+	converted, err := convertOpenAINonStreamResponseToClaudeCtx(body, cam)
 	if err != nil {
 		return err
 	}
@@ -703,6 +731,24 @@ func (s *Server) writeClaudeSuccess(w http.ResponseWriter, resp *http.Response, 
 	w.WriteHeader(resp.StatusCode)
 	_, err = w.Write(converted)
 	return err
+}
+
+// responseTracker records whether any bytes (including the status line) were
+// committed to the client, so a pre-commit failure can still produce a proper
+// error response.
+type responseTracker struct {
+	http.ResponseWriter
+	committed bool
+}
+
+func (t *responseTracker) WriteHeader(statusCode int) {
+	t.committed = true
+	t.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (t *responseTracker) Write(p []byte) (int, error) {
+	t.committed = true
+	return t.ResponseWriter.Write(p)
 }
 
 func (s *Server) injectUpstreamMetadata(pool *tokenPool, payload map[string]any, requestedModel, runID, sessionInstanceID string) ([]byte, error) {

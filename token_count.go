@@ -24,6 +24,11 @@ func countOpenAIPayloadTokens(model string, payload map[string]any) (int64, erro
 
 func tokenizerForModel(model string) (tokenizer.Codec, error) {
 	sanitized := strings.ToLower(strings.TrimSpace(model))
+	// Served ids are vendor-qualified ("openai/gpt-5.5"); match on the
+	// model part only.
+	if idx := strings.LastIndex(sanitized, "/"); idx >= 0 {
+		sanitized = sanitized[idx+1:]
+	}
 	switch {
 	case sanitized == "":
 		return tokenizer.Get(tokenizer.Cl100kBase)

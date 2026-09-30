@@ -21,6 +21,7 @@ type upstreamStub struct {
 	chatResponse   string
 	queuedPost     bool
 	plainJSON      bool
+	startCount     int
 }
 
 func newUpstreamStub() *upstreamStub {
@@ -30,6 +31,9 @@ func newUpstreamStub() *upstreamStub {
 func (s *upstreamStub) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/agent-runs", func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		s.startCount++
+		s.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"runId":"run-stub-1"}`))
 	})
@@ -543,5 +547,193 @@ func TestAuthorizedEitherHeader(t *testing.T) {
 		if got := server.authorized(request); got != tc.want {
 			t.Errorf("%s: authorized = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestDecideOnlyFinishDowngrade(t *testing.T) {
+	stub := newUpstreamStub()
+	stub.mu.Lock()
+	stub.chatResponse = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"minimax/minimax-m3\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n" +
+		"data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"minimax/minimax-m3\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"d1\",\"type\":\"function\",\"function\":{\"name\":\"decide\",\"arguments\":\"{\\\"decision\\\":\\\"x\\\"}\"}}]},\"finish_reason\":null}]}\n\n" +
+		"data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"minimax/minimax-m3\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"minimax/minimax-m3\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n" +
+		"data: [DONE]\n\n"
+	stub.mu.Unlock()
+	upstream := httptest.NewServer(stub.handler())
+	defer upstream.Close()
+
+	server := newTestServer(t, stub, upstream.URL)
+
+	rec := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"minimax/minimax-m3","messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Authorization", "Bearer sk-test-client")
+	server.Handler().ServeHTTP(rec, request)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var completion map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &completion); err != nil {
+		t.Fatalf("decode: %v\n%s", err, rec.Body.String())
+	}
+	choice := completion["choices"].([]any)[0].(map[string]any)
+	if choice["finish_reason"] != "stop" {
+		t.Fatalf("finish_reason = %v, want stop (decide-only response)", choice["finish_reason"])
+	}
+	message := choice["message"].(map[string]any)
+	if _, present := message["tool_calls"]; present {
+		t.Fatalf("tool_calls leaked: %v", message["tool_calls"])
+	}
+}
+
+func TestNativeMcpToolPassthrough(t *testing.T) {
+	stub := newUpstreamStub()
+	stub.mu.Lock()
+	stub.chatResponse = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"minimax/minimax-m3\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"n1\",\"type\":\"function\",\"function\":{\"name\":\"mcp__github__get_me\",\"arguments\":\"{}\"}},{\"index\":1,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"mcp__bash\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	stub.mu.Unlock()
+	upstream := httptest.NewServer(stub.handler())
+	defer upstream.Close()
+
+	server := newTestServer(t, stub, upstream.URL)
+
+	rec := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"minimax/minimax-m3",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[
+			{"type":"function","function":{"name":"bash"}},
+			{"type":"function","function":{"name":"mcp__github__get_me"}}
+		]
+	}`))
+	request.Header.Set("Authorization", "Bearer sk-test-client")
+	server.Handler().ServeHTTP(rec, request)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var completion map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &completion); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	message := completion["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	calls := message["tool_calls"].([]any)
+	names := map[string]bool{}
+	for _, raw := range calls {
+		fn := raw.(map[string]any)["function"].(map[string]any)
+		names[fn["name"].(string)] = true
+	}
+	if !names["mcp__github__get_me"] {
+		t.Fatalf("native mcp__ tool name was stripped: %v", names)
+	}
+	if !names["bash"] {
+		t.Fatalf("camouflaged tool name not stripped back: %v", names)
+	}
+	if len(names) != 2 {
+		t.Fatalf("unexpected tool names: %v", names)
+	}
+}
+
+func TestBlankDoneOnlyStreamSurfaces502(t *testing.T) {
+	stub := newUpstreamStub()
+	stub.mu.Lock()
+	stub.chatResponse = "data: [DONE]\n\n"
+	stub.mu.Unlock()
+	upstream := httptest.NewServer(stub.handler())
+	defer upstream.Close()
+
+	server := newTestServer(t, stub, upstream.URL)
+
+	rec := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"minimax/minimax-m3","messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Authorization", "Bearer sk-test-client")
+	server.Handler().ServeHTTP(rec, request)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 for a [DONE]-only upstream stream", rec.Code)
+	}
+	if strings.TrimSpace(rec.Body.String()) == "" {
+		t.Fatal("empty response body")
+	}
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	if len(stub.chatBodies) != maxProxyAttempts {
+		t.Fatalf("upstream attempts = %d, want %d (blank stream must be retried)", len(stub.chatBodies), maxProxyAttempts)
+	}
+}
+
+func TestConcurrentRotationSingleFlight(t *testing.T) {
+	stub := newUpstreamStub()
+	upstream := httptest.NewServer(stub.handler())
+	defer upstream.Close()
+
+	cfg := Config{RequestTimeout: 5 * time.Second, RotationInterval: time.Hour}
+	client := NewUpstreamClient(cfg)
+	client.baseURL = upstream.URL
+	pool := &tokenPool{
+		name: "token-test", token: "k", cfg: cfg, client: client,
+		runs: make(map[string]*managedRun), logger: discardLogger(),
+		chatGate: make(chan struct{}, 1),
+	}
+
+	const workers = 5
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			errs <- pool.rotateAgent(context.Background(), "base2-free")
+		}()
+	}
+	for i := 0; i < workers; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("rotateAgent: %v", err)
+		}
+	}
+
+	stub.mu.Lock()
+	starts := stub.startCount
+	stub.mu.Unlock()
+	if starts != 1 {
+		t.Fatalf("StartRun calls = %d, want 1 (concurrent rotations must collapse)", starts)
+	}
+	pool.mu.Lock()
+	runs := len(pool.runs)
+	pool.mu.Unlock()
+	if runs != 1 {
+		t.Fatalf("runs = %d, want 1", runs)
+	}
+}
+
+func TestClaudeNonStreamKeepsThinkingBlocks(t *testing.T) {
+	stub := newUpstreamStub()
+	stub.mu.Lock()
+	stub.chatResponse = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"minimax/minimax-m3\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"thinking hard\"},\"finish_reason\":null}]}\n\n" +
+		"data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"minimax/minimax-m3\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	stub.mu.Unlock()
+	upstream := httptest.NewServer(stub.handler())
+	defer upstream.Close()
+
+	server := newTestServer(t, stub, upstream.URL)
+
+	rec := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"minimax/minimax-m3","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Authorization", "Bearer sk-test-client")
+	server.Handler().ServeHTTP(rec, request)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var message map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &message); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	foundThinking := false
+	for _, block := range message["content"].([]any) {
+		if block.(map[string]any)["type"] == "thinking" {
+			foundThinking = true
+		}
+	}
+	if !foundThinking {
+		t.Fatalf("reasoning was promoted to text instead of a thinking block: %v", message["content"])
 	}
 }

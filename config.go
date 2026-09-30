@@ -76,7 +76,7 @@ func loadConfig(configPath string) (Config, error) {
 		return Config{}, fmt.Errorf("parse request timeout: %w", err)
 	}
 
-	upstreamMinGap := defaultUpstreamGap
+	upstreamMinGap := time.Duration(-1) // sentinel: use the built-in default
 	if strings.TrimSpace(cfg.UpstreamMinGap) != "" {
 		upstreamMinGap, err = time.ParseDuration(strings.TrimSpace(cfg.UpstreamMinGap))
 		if err != nil {

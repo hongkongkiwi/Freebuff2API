@@ -60,6 +60,10 @@ type tokenPool struct {
 	chatGate   chan struct{}
 	nextChatAt time.Time
 
+	// rotateMu serializes per-agent run rotation so concurrent acquires on a
+	// cold or just-rotated agent do not burst duplicate START/FINISH pairs.
+	rotateMu sync.Mutex
+
 	// health classifies the account for operators: ok, token_invalid,
 	// rate_limited, banned, country_blocked, blocked.
 	health string
@@ -177,8 +181,22 @@ func NewRunManager(cfg Config, client *UpstreamClient, logger *log.Logger) *RunM
 
 func (m *RunManager) Start(ctx context.Context) {
 	// Pre-warm the free session in the background; runs are created lazily
-	// per agent on first request.
-	go m.prewarm()
+	// per agent on first request. Tracked so Close waits for it, and
+	// canceled on shutdown so it cannot race pool shutdown.
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		prewarmCtx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			select {
+			case <-m.stopCh:
+				cancel()
+			case <-prewarmCtx.Done():
+			}
+		}()
+		m.prewarm(prewarmCtx)
+	}()
 
 	m.wg.Add(1)
 	go func() {
@@ -206,12 +224,12 @@ func (m *RunManager) Start(ctx context.Context) {
 // prewarm establishes the free session for each pool. Runs are created
 // lazily per agent on first use — starting runs for the whole catalog (~80
 // agents) at startup would hammer the upstream with pointless calls.
-func (m *RunManager) prewarm() {
-	ctx, cancel := context.WithTimeout(context.Background(), m.cfg.RequestTimeout)
+func (m *RunManager) prewarm(ctx context.Context) {
+	prewarmCtx, cancel := context.WithTimeout(ctx, m.cfg.RequestTimeout)
 	defer cancel()
 
 	for _, pool := range m.pools {
-		if _, err := pool.ensureSession(ctx); err != nil {
+		if _, err := pool.ensureSession(prewarmCtx); err != nil {
 			m.logger.Printf("%s: free session prewarm failed: %v", pool.name, err)
 		}
 	}
@@ -248,7 +266,10 @@ func (m *RunManager) Acquire(ctx context.Context, agentID string) (*runLease, er
 		errs = append(errs, fmt.Sprintf("%s: %v", pool.name, err))
 	}
 
-	if len(waiting) == len(m.pools) && len(waiting) > 0 {
+	// Surface the best waiting-room error whenever any pool is queued and
+	// none succeeded — the client gets position + Retry-After rather than a
+	// generic 502.
+	if len(waiting) > 0 {
 		best := waiting[0]
 		for _, candidate := range waiting[1:] {
 			if candidate != nil && (best == nil || (candidate.Position > 0 && candidate.Position < best.Position)) {
@@ -317,14 +338,16 @@ func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, err
 	needsRotate := run == nil || time.Since(run.startedAt) >= p.cfg.RotationInterval
 	p.mu.Unlock()
 
+	// Session first: an account stuck in the waiting room should not burn a
+	// run START that would then sit idle.
+	if _, err := p.ensureSession(ctx); err != nil {
+		return nil, err
+	}
+
 	if needsRotate {
 		if err := p.rotateAgent(ctx, agentID); err != nil {
 			return nil, err
 		}
-	}
-
-	if _, err := p.ensureSession(ctx); err != nil {
-		return nil, err
 	}
 
 	p.mu.Lock()
@@ -400,11 +423,21 @@ func (p *tokenPool) shutdown(ctx context.Context) error {
 }
 
 func (p *tokenPool) rotateAgent(ctx context.Context, agentID string) error {
+	// Single-flight: concurrent acquires for the same agent collapse into one
+	// START; later callers reuse the fresh run instead of rotating again.
+	p.rotateMu.Lock()
+	defer p.rotateMu.Unlock()
+
 	p.mu.Lock()
 	if now := time.Now(); now.Before(p.cooldownUntil) {
 		cooldownUntil := p.cooldownUntil
 		p.mu.Unlock()
 		return fmt.Errorf("token cooling down until %s", cooldownUntil.Format(time.RFC3339))
+	}
+	if run := p.runs[agentID]; run != nil && time.Since(run.startedAt) < p.cfg.RotationInterval {
+		// Someone rotated while we waited on rotateMu; the fresh run is good.
+		p.mu.Unlock()
+		return nil
 	}
 	p.mu.Unlock()
 
@@ -591,11 +624,16 @@ func (p *tokenPool) acquireChatSlot(ctx context.Context) (func(), error) {
 	}
 
 	gap := p.cfg.UpstreamMinGap
-	if gap <= 0 {
+	if gap < 0 {
 		gap = defaultUpstreamGap
 	}
-	jitter := time.Duration(rand.Int63n(int64(defaultUpstreamGapJitter)))
-	p.nextChatAt = time.Now().Add(gap + jitter)
+	if gap > 0 {
+		jitter := time.Duration(rand.Int63n(int64(defaultUpstreamGapJitter)))
+		p.nextChatAt = time.Now().Add(gap + jitter)
+	} else {
+		// Explicitly disabled gap: keep the serialization gate with no wait.
+		p.nextChatAt = time.Now()
+	}
 
 	return func() { <-p.chatGate }, nil
 }

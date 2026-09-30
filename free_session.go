@@ -14,6 +14,9 @@ import (
 
 const freeSessionPollInterval = 5 * time.Second
 
+// maxSessionReposts bounds the create-after-end loop in refreshSession.
+const maxSessionReposts = 3
+
 type sessionStatus string
 
 const (
@@ -151,6 +154,7 @@ func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string,
 		}
 	}
 
+	reposts := 0
 	for {
 		switch sessionStatus(strings.TrimSpace(state.Status)) {
 		case sessionStatusDisabled:
@@ -187,6 +191,12 @@ func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string,
 				retryAfter: delay,
 			}, "", nil
 		case sessionStatusNone, sessionStatusEnded, sessionStatusSuperseded:
+			// Bound the re-create loop so a hostile upstream answering
+			// "ended" forever cannot wedge the request.
+			reposts++
+			if reposts > maxSessionReposts {
+				return nil, "", fmt.Errorf("free session kept ending (status %q after %d attempts)", state.Status, reposts)
+			}
 			state, err = p.client.CreateOrRefreshSession(ctx, p.token)
 			if err != nil {
 				return nil, "", fmt.Errorf("refresh free session: %w", err)
@@ -324,7 +334,7 @@ func (c *UpstreamClient) EndSession(ctx context.Context, authToken string) error
 		return nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBody))
 		return fmt.Errorf("free session delete failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return nil
@@ -368,7 +378,7 @@ func (c *UpstreamClient) doSessionRequest(ctx context.Context, method, authToken
 		return freeSessionResponse{Status: string(sessionStatusDisabled)}, nil
 	}
 
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBody))
 	if err != nil {
 		return freeSessionResponse{}, fmt.Errorf("read free session response: %w", err)
 	}

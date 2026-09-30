@@ -264,6 +264,22 @@ func convertChatCompletionToResponses(final map[string]any) map[string]any {
 		}
 	}
 
+	// Claude-style decide-only upstream replies leave no output items; emit
+	// an empty assistant message so the response is never empty.
+	if len(output) == 0 {
+		output = append(output, map[string]any{
+			"id":     "msg_" + uuid.NewString(),
+			"type":   "message",
+			"role":   "assistant",
+			"status": "completed",
+			"content": []any{map[string]any{
+				"type":        "output_text",
+				"text":        "",
+				"annotations": []any{},
+			}},
+		})
+	}
+
 	response := map[string]any{
 		"id":                  responseID,
 		"object":              "response",
@@ -297,9 +313,15 @@ type responsesEvent struct {
 }
 
 // writeResponsesStreamingResponse converts a chat-completions SSE stream into
-// Responses API events. Headers are committed with the first event so a blank
-// upstream stream can still be retried.
+// Responses API events with response-side camouflage stripping enabled.
 func writeResponsesStreamingResponse(w http.ResponseWriter, resp *http.Response, requestedModel string) error {
+	return writeResponsesStreamingResponseCtx(w, resp, requestedModel, camouflageCtx{strip: true})
+}
+
+// writeResponsesStreamingResponseCtx converts a chat-completions SSE stream
+// into Responses API events. Headers are committed with the first event so a
+// blank upstream stream can still be retried.
+func writeResponsesStreamingResponseCtx(w http.ResponseWriter, resp *http.Response, requestedModel string, cam camouflageCtx) error {
 	flusher, _ := w.(http.Flusher)
 	reader := bufio.NewReader(resp.Body)
 	committed := false
@@ -413,11 +435,19 @@ func writeResponsesStreamingResponse(w http.ResponseWriter, resp *http.Response,
 									functionCalls = append(functionCalls, &responsesFunctionCallState{})
 								}
 								state := functionCalls[toolCall.Index]
+								if state.Skipped {
+									continue
+								}
 								if toolCall.ID != "" {
 									state.CallID = toolCall.ID
 								}
 								if toolCall.Function.Name != "" {
-									state.Name = toolCall.Function.Name
+									name, keep := cam.clientToolName(toolCall.Function.Name)
+									if !keep {
+										state.Skipped = true
+										continue
+									}
+									state.Name = name
 								}
 								state.Arguments.WriteString(toolCall.Function.Arguments)
 							}
@@ -432,6 +462,21 @@ func writeResponsesStreamingResponse(w http.ResponseWriter, resp *http.Response,
 			}
 			if payloadCount == 0 && !committed {
 				return errBlankUpstreamStream
+			}
+			if committed {
+				// The client already saw events; close the stream out with a
+				// terminal failure so it never hangs waiting for completion.
+				_ = writeEvents([]responsesEvent{{
+					Name: "response.failed",
+					Payload: map[string]any{
+						"type": "response.failed",
+						"response": map[string]any{
+							"id": responseID, "object": "response", "status": "failed",
+							"model": requestedModel, "output": []any{},
+							"error": map[string]any{"code": "upstream_error", "message": err.Error()},
+						},
+					},
+				}})
 			}
 			return err
 		}
@@ -494,7 +539,7 @@ func writeResponsesStreamingResponse(w http.ResponseWriter, resp *http.Response,
 	outputIndex++
 
 	for _, call := range functionCalls {
-		if call.Name == "" {
+		if call.Name == "" || call.Skipped {
 			continue
 		}
 		itemID := "fc_" + uuid.NewString()
@@ -559,5 +604,6 @@ func writeResponsesStreamingResponse(w http.ResponseWriter, resp *http.Response,
 type responsesFunctionCallState struct {
 	CallID    string
 	Name      string
+	Skipped   bool
 	Arguments strings.Builder
 }

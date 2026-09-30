@@ -35,6 +35,10 @@ func NewUpstreamClient(cfg Config) *UpstreamClient {
 	}
 }
 
+// maxUpstreamErrorBody caps how many bytes of an upstream error response are
+// read into memory.
+const maxUpstreamErrorBody = 64 << 10
+
 func (c *UpstreamClient) StartRun(ctx context.Context, authToken, agentID string) (string, error) {
 	payload := map[string]any{
 		"action":  "START",
@@ -51,7 +55,7 @@ func (c *UpstreamClient) StartRun(ctx context.Context, authToken, agentID string
 	}
 	defer resp.Body.Close()
 
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBody))
 	if err != nil {
 		return "", fmt.Errorf("read start run response: %w", err)
 	}
@@ -92,7 +96,7 @@ func (c *UpstreamClient) FinishRun(ctx context.Context, authToken, runID string,
 	}
 	defer resp.Body.Close()
 
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBody))
 	if err != nil {
 		return fmt.Errorf("read finish run response: %w", err)
 	}
@@ -112,7 +116,7 @@ func (c *UpstreamClient) ChatCompletions(ctx context.Context, authToken string, 
 		return resp, nil, nil
 	}
 
-	responseBody, readErr := io.ReadAll(resp.Body)
+	responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBody))
 	resp.Body.Close()
 	if readErr != nil {
 		return nil, nil, fmt.Errorf("read upstream error response: %w", readErr)

@@ -96,6 +96,8 @@ func TestClampReasoningEffort(t *testing.T) {
 		{"deepseek/deepseek-v4-flash", "minimal", "low"}, // below ladder floor
 		{"deepseek/deepseek-v4-flash", "weird", "low"},   // unknown effort → floor
 		{"pinned/model", "max", "high"},                  // pin wins
+		{"pinned/model", "auto", "high"},                 // pin beats sentinels
+		{"pinned/model", "none", "high"},                 // pin beats sentinels
 		{"unknown/model", "medium", "medium"},            // no ladder → passthrough
 		{"deepseek/deepseek-v4-flash", "auto", "auto"},   // sentinels untouched
 		{"deepseek/deepseek-v4-flash", "none", "none"},

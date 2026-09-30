@@ -617,35 +617,13 @@ func sanitizeClaudeToolID(id string) string {
 	return builder.String()
 }
 
-func writeClaudeSuccessResponse(w http.ResponseWriter, resp *http.Response, requestedModel string, stream bool) error {
-	if stream {
-		return writeClaudeStreamingResponse(w, resp, requestedModel)
-	}
-	final, err := reassembleOpenAIStreamResponse(resp.Body, false)
-	if err != nil {
-		return err
-	}
-	body, err := json.Marshal(final)
-	if err != nil {
-		return err
-	}
-	converted, err := convertOpenAINonStreamResponseToClaude(body)
-	if err != nil {
-		return err
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(resp.StatusCode)
-	_, err = w.Write(converted)
-	return err
-}
-
-func writeClaudeNonStreamResponse(w http.ResponseWriter, resp *http.Response) error {
+func writeClaudeNonStreamResponse(w http.ResponseWriter, resp *http.Response, cam camouflageCtx) error {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
 
-	converted, err := convertOpenAINonStreamResponseToClaude(body)
+	converted, err := convertOpenAINonStreamResponseToClaudeCtx(body, cam)
 	if err != nil {
 		return err
 	}
@@ -656,7 +634,13 @@ func writeClaudeNonStreamResponse(w http.ResponseWriter, resp *http.Response) er
 	return err
 }
 
+// writeClaudeStreamingResponse converts with response-side camouflage
+// stripping enabled (the historical default).
 func writeClaudeStreamingResponse(w http.ResponseWriter, resp *http.Response, requestedModel string) error {
+	return writeClaudeStreamingResponseCtx(w, resp, requestedModel, camouflageCtx{strip: true})
+}
+
+func writeClaudeStreamingResponseCtx(w http.ResponseWriter, resp *http.Response, requestedModel string, cam camouflageCtx) error {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -669,6 +653,7 @@ func writeClaudeStreamingResponse(w http.ResponseWriter, resp *http.Response, re
 		ThinkingBlockIdx:    -1,
 		ToolBlocks:          make(map[int]*claudeToolCallState),
 		ToolBlockIndexes:    make(map[int]int),
+		camouflage:          cam,
 	}
 
 	// Headers are committed only when the first events are written so a fully
@@ -692,10 +677,33 @@ func writeClaudeStreamingResponse(w http.ResponseWriter, resp *http.Response, re
 			if len(trimmed) > 0 && !bytes.HasPrefix(trimmed, []byte(":")) && bytes.HasPrefix(trimmed, []byte("data:")) {
 				payload := bytes.TrimSpace(trimmed[5:])
 				if len(payload) > 0 {
-					payloadCount++
 					if bytes.Equal(payload, []byte("[DONE]")) {
 						sawDone = true
+						// A [DONE]-only stream is blank: nothing was relayed,
+						// so let the caller retry with a fresh session.
+						if payloadCount == 0 && !committed {
+							return errBlankUpstreamStream
+						}
+						// Terminal events for the relayed content.
+						events, finalizeErr := finalizeClaudeStream(state)
+						if finalizeErr != nil {
+							if streamErr == nil {
+								streamErr = finalizeErr
+							}
+							break
+						}
+						if len(events) > 0 {
+							commitHeader()
+							if err := writeClaudeSSEEvents(w, events); err != nil {
+								return err
+							}
+							if flusher != nil {
+								flusher.Flush()
+							}
+						}
+						continue
 					}
+					payloadCount++
 
 					events, convErr := convertOpenAIStreamPayloadToClaudeEvents(payload, state)
 					if convErr != nil {
@@ -806,7 +814,13 @@ type openAIPromptTokensDetail struct {
 	CachedTokens int64 `json:"cached_tokens"`
 }
 
+// convertOpenAINonStreamResponseToClaude converts with response-side
+// camouflage stripping enabled (the historical default).
 func convertOpenAINonStreamResponseToClaude(body []byte) ([]byte, error) {
+	return convertOpenAINonStreamResponseToClaudeCtx(body, camouflageCtx{strip: true})
+}
+
+func convertOpenAINonStreamResponseToClaudeCtx(body []byte, cam camouflageCtx) ([]byte, error) {
 	var response openAIChatCompletion
 	if err := json.Unmarshal(body, &response); err != nil {
 		return nil, fmt.Errorf("decode upstream response: %w", err)
@@ -835,12 +849,12 @@ func convertOpenAINonStreamResponseToClaude(body []byte) ([]byte, error) {
 				"thinking": text,
 			})
 		}
-		for _, block := range convertOpenAIContentToClaudeBlocks(choice.Message.Content) {
+		for _, block := range convertOpenAIContentToClaudeBlocks(choice.Message.Content, cam) {
 			message["content"] = append(message["content"].([]any), block)
 		}
 		for _, toolCall := range choice.Message.ToolCalls {
-			name := fromWireToolName(toolCall.Function.Name)
-			if isSignatureToolName(name) {
+			name, keep := cam.clientToolName(toolCall.Function.Name)
+			if !keep {
 				continue
 			}
 			hasToolCall = true
@@ -874,6 +888,11 @@ func convertOpenAINonStreamResponseToClaude(body []byte) ([]byte, error) {
 	if message["stop_reason"] == "end_turn" && hasToolCall {
 		message["stop_reason"] = "tool_use"
 	}
+	// A decide-only response reports tool_use with no tool block; report a
+	// plain end of turn instead.
+	if message["stop_reason"] == "tool_use" && !hasToolCall {
+		message["stop_reason"] = "end_turn"
+	}
 
 	return json.Marshal(message)
 }
@@ -894,6 +913,7 @@ type claudeStreamState struct {
 	MessageDeltaSent     bool
 	MessageStopSent      bool
 	ContentBlocksStopped bool
+	camouflage           camouflageCtx
 }
 
 type claudeToolCallState struct {
@@ -953,7 +973,9 @@ func convertOpenAIStreamPayloadToClaudeEvents(payload []byte, state *claudeStrea
 		state.MessageStarted = true
 	}
 
-	if len(chunk.Choices) > 0 {
+	// Deltas after the finish chunk would open content blocks that can never
+	// be closed before message_stop; drop them.
+	if len(chunk.Choices) > 0 && !state.ContentBlocksStopped {
 		choice := chunk.Choices[0]
 		for _, text := range collectReasoningTexts(choice.Delta.ReasoningContent) {
 			stopTextContentBlock(state, &events)
@@ -1022,11 +1044,10 @@ func convertOpenAIStreamPayloadToClaudeEvents(payload []byte, state *claudeStrea
 		}
 
 		for _, toolCall := range choice.Delta.ToolCalls {
-			name := fromWireToolName(toolCall.Function.Name)
-			if isSignatureToolName(name) {
+			name, keep := state.camouflage.clientToolName(toolCall.Function.Name)
+			if !keep {
 				continue
 			}
-			state.SawToolCall = true
 			stopThinkingContentBlock(state, &events)
 			stopTextContentBlock(state, &events)
 
@@ -1063,6 +1084,10 @@ func convertOpenAIStreamPayloadToClaudeEvents(payload []byte, state *claudeStrea
 				}
 				events = append(events, claudeSSEEvent{Name: "content_block_start", Payload: payload})
 				accumulator.Started = true
+				// Only a tool block that actually started counts toward the
+				// tool_calls finish reason; decide-dropped or nameless calls
+				// must not report tool_use with no tool block.
+				state.SawToolCall = true
 			}
 		}
 
@@ -1210,6 +1235,10 @@ func effectiveOpenAIFinishReason(state *claudeStreamState) string {
 	if state.SawToolCall {
 		return "tool_calls"
 	}
+	if strings.EqualFold(strings.TrimSpace(state.FinishReason), "tool_calls") {
+		// Only decide (signature) calls were seen; report a plain stop.
+		return "stop"
+	}
 	if strings.TrimSpace(state.FinishReason) == "" {
 		return "stop"
 	}
@@ -1284,7 +1313,7 @@ func writeClaudeSSEEvents(w http.ResponseWriter, events []claudeSSEEvent) error 
 	return nil
 }
 
-func convertOpenAIContentToClaudeBlocks(raw json.RawMessage) []any {
+func convertOpenAIContentToClaudeBlocks(raw json.RawMessage, cam camouflageCtx) []any {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
 		return nil
@@ -1329,8 +1358,8 @@ func convertOpenAIContentToClaudeBlocks(raw json.RawMessage) []any {
 					continue
 				}
 				function := mapValue(toolCall["function"])
-				name := fromWireToolName(stringValue(function["name"]))
-				if isSignatureToolName(name) {
+				name, keep := cam.clientToolName(stringValue(function["name"]))
+				if !keep {
 					continue
 				}
 				blocks = append(blocks, map[string]any{

@@ -14,6 +14,10 @@ func readCloserFromString(s string) io.ReadCloser {
 	return io.NopCloser(strings.NewReader(s))
 }
 
+func readCloserFromReader(r io.Reader) io.ReadCloser {
+	return io.NopCloser(r)
+}
+
 func TestConvertResponsesRequestStringInput(t *testing.T) {
 	payload, model, stream, err := convertResponsesRequestToChat([]byte(`{
 		"model": "z-ai/glm-5.2",
@@ -237,5 +241,71 @@ func TestWriteResponsesStreamingBlankStream(t *testing.T) {
 	}
 	if rec.Body.Len() != 0 {
 		t.Fatalf("bytes written for blank stream: %q", rec.Body.String())
+	}
+}
+
+func TestResponsesStreamingStripsCamouflage(t *testing.T) {
+	body := "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n" +
+		"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"t1\",\"type\":\"function\",\"function\":{\"name\":\"mcp__bash\",\"arguments\":\"{\\\"a\\\":1}\"}}]},\"finish_reason\":null}]}\n\n" +
+		"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"t2\",\"type\":\"function\",\"function\":{\"name\":\"decide\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	rec := httptest.NewRecorder()
+	resp := &http.Response{StatusCode: http.StatusOK, Body: readCloserFromString(body)}
+	if err := writeResponsesStreamingResponseCtx(rec, resp, "m", camouflageCtx{strip: true}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	completedRaw := ""
+	for _, frame := range strings.Split(rec.Body.String(), "\n\n") {
+		if strings.HasPrefix(frame, "event: response.completed") {
+			for _, line := range strings.Split(frame, "\n") {
+				if strings.HasPrefix(line, "data: ") {
+					completedRaw = strings.TrimPrefix(line, "data: ")
+				}
+			}
+		}
+	}
+	if completedRaw == "" {
+		t.Fatalf("response.completed event missing:\n%s", rec.Body.String())
+	}
+	var event struct {
+		Response struct {
+			Output []map[string]any `json:"output"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal([]byte(completedRaw), &event); err != nil {
+		t.Fatalf("decode completed: %v", err)
+	}
+	var functionCalls []string
+	for _, item := range event.Response.Output {
+		if item["type"] == "function_call" {
+			functionCalls = append(functionCalls, item["name"].(string))
+		}
+	}
+	if len(functionCalls) != 1 || functionCalls[0] != "bash" {
+		t.Fatalf("function calls = %v, want exactly [bash] (mcp__ stripped, decide dropped)", functionCalls)
+	}
+}
+
+func TestResponsesFailedEventOnMidStreamError(t *testing.T) {
+	reader := &failAfterBodyReader{
+		data: []byte("data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial\"},\"finish_reason\":null}]}\n\n"),
+	}
+	rec := httptest.NewRecorder()
+	resp := &http.Response{StatusCode: http.StatusOK, Body: readCloserFromReader(reader)}
+	err := writeResponsesStreamingResponseCtx(rec, resp, "m", camouflageCtx{strip: true})
+	if err == nil {
+		t.Fatal("expected an error from a mid-stream read failure")
+	}
+
+	var lastEvent string
+	for _, frame := range strings.Split(rec.Body.String(), "\n\n") {
+		if strings.HasPrefix(frame, "event: ") {
+			lastEvent = strings.TrimSpace(strings.TrimPrefix(strings.SplitN(frame, "\n", 2)[0], "event: "))
+		}
+	}
+	if lastEvent != "response.failed" {
+		t.Fatalf("last event = %q, want response.failed; body:\n%s", lastEvent, rec.Body.String())
 	}
 }
