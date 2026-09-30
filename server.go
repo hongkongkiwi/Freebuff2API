@@ -210,10 +210,11 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := map[string]any{
-		"ok":          true,
-		"started_at":  s.started.UTC(),
-		"uptime_sec":  int(time.Since(s.started).Seconds()),
-		"token_state": s.runs.Snapshots(),
+		"ok":             true,
+		"started_at":     s.started.UTC(),
+		"uptime_sec":     int(time.Since(s.started).Seconds()),
+		"model_registry": s.registry.Status(),
+		"token_state":    s.runs.Snapshots(),
 	}
 	writeJSON(w, http.StatusOK, response)
 }
@@ -264,8 +265,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	requestedModel, _ := payload["model"].(string)
 	requestedModel = strings.TrimSpace(requestedModel)
 	if requestedModel == "" {
-		writeOpenAIError(w, http.StatusBadRequest, "model is required", "invalid_request_error", "")
-		return
+		requestedModel = s.registry.DefaultModel()
 	}
 
 	clientStream := boolValue(payload["stream"])
@@ -582,6 +582,11 @@ func (s *Server) injectUpstreamMetadata(pool *tokenPool, payload map[string]any,
 	}
 	if tools, ok := cloned["tools"].([]any); ok && len(tools) > 0 && s.cfg.ToolCamouflage {
 		camouflageToolsForUpstream(cloned)
+	}
+	// Narrow the client's reasoning effort to the ladder the upstream catalog
+	// publishes for this model (applies after Claude thinking→effort mapping).
+	if effort, ok := cloned["reasoning_effort"].(string); ok {
+		cloned["reasoning_effort"] = s.registry.ClampReasoningEffort(requestedModel, effort)
 	}
 
 	metadata, ok := cloned["codebuff_metadata"].(map[string]any)
