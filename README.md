@@ -6,10 +6,17 @@ Freebuff2API is an OpenAI-compatible proxy server for [Freebuff](https://freebuf
 
 ## Features
 
-- **OpenAI Compatible API** — Standard OpenAI endpoints; works with any compatible client out of the box.
-- **Stealth Request Handling** — Dynamic, randomized client fingerprints that mimic official Freebuff SDK behavior.
-- **Multi-Token Rotation** — Cycle through multiple auth tokens with automatic periodic rotation.
+- **OpenAI Compatible API** — Standard `/v1/chat/completions`, `/v1/models`, and `/v1/responses` (Responses API) endpoints.
+- **Claude / Anthropic Compatible API** — Full `/v1/messages` translation including streaming (`message_start` → `content_block_delta` → `message_stop`), thinking blocks, tool use, images, and tiktoken-accurate `/v1/messages/count_tokens`.
+- **Protocol Compatibility Layer** — Applies the Buffy system-prompt requirement, toolset signature (camouflaged tool names + `decide` bookkeeping tool), harness-phrase rewrites, forced upstream streaming with response reassembly, and the `cb_easp` stop sentinel the free tier expects.
+- **Resilient Session Handling** — Free-session lifecycle with waiting-room polling, recovery from `session_superseded` / `session_model_mismatch` / `model_locked` / blank streams, 429-aware cooldowns parsed from `retryAfterMs`, and a per-account circuit breaker.
+- **Stable Per-Account Identity** — Each token keeps a stable `client_id` (matching the official SDK format) instead of per-request randomness.
+- **Per-Account Serialization** — Upstream chat calls on one account are serialized with a minimum gap, matching the free tier's single-request behavior.
+- **Multi-Token Rotation** — Cycle through multiple auth tokens with automatic periodic run rotation and draining.
+- **Live Model Catalog** — Parses the upstream freebuff model constants (`free-agents.ts`, `freebuff-models.ts`, `freebuff-model-ids.ts`) with a jsDelivr mirror fallback, 6-hour refresh, per-model reasoning-effort ladders, and a built-in snapshot fallback.
+- **Health Endpoint** — `/healthz` reports per-token session state, queue position, quota tier and remaining rate limits, health classification, cooldowns, and model-registry status.
 - **HTTP Proxy Support** — Route all outbound traffic through a configurable upstream proxy.
+- **Token Onboarding CLI** — `cmd/freebuff-token` performs the device-code login and writes the token into `config.json`.
 
 ## Getting Auth Tokens
 
@@ -52,6 +59,16 @@ The file looks like:
 
 Only the `authToken` value is needed — copy it as your **AUTH_TOKENS**.
 
+### Method 3 — Device Login CLI
+
+Use the bundled CLI to log in interactively and store the token directly in your config:
+
+```bash
+go run ./cmd/freebuff-token --write-config
+```
+
+It prints a login URL, polls until you authorize, and appends the resulting token to `AUTH_TOKENS` in `config.json`.
+
 > **Tip:** Log in with multiple accounts and configure all their tokens for higher throughput.
 
 ## Configuration
@@ -61,12 +78,18 @@ Configuration is managed via a JSON file and/or environment variables. The JSON 
 ```json
 {
   "LISTEN_ADDR": ":8080",
-  "UPSTREAM_BASE_URL": "https://codebuff.com",
+  "UPSTREAM_BASE_URL": "https://www.codebuff.com",
   "AUTH_TOKENS": ["eyJhb..."],
   "ROTATION_INTERVAL": "6h",
   "REQUEST_TIMEOUT": "15m",
   "API_KEYS": [],
-  "HTTP_PROXY": ""
+  "HTTP_PROXY": "",
+  "MAX_REQUEST_BODY_MB": 32,
+  "FORCE_UPSTREAM_STREAM": true,
+  "TOOL_CAMOUFLAGE": true,
+  "HARNESS_REWRITES": true,
+  "BUFFY_GUARD": true,
+  "UPSTREAM_MIN_GAP": "300ms"
 }
 ```
 
@@ -75,12 +98,18 @@ Configuration is managed via a JSON file and/or environment variables. The JSON 
 | Key / Env Var | Description |
 |---|---|
 | `LISTEN_ADDR` | Proxy listen address (default `:8080`) |
-| `UPSTREAM_BASE_URL` | Freebuff backend URL (default `https://codebuff.com`) |
+| `UPSTREAM_BASE_URL` | Freebuff backend URL (default `https://www.codebuff.com`) |
 | `AUTH_TOKENS` | Freebuff auth tokens (JSON array or comma-separated env var) |
 | `ROTATION_INTERVAL` | Run rotation interval (default `6h`) |
 | `REQUEST_TIMEOUT` | Upstream request timeout (default `15m`) |
 | `API_KEYS` | Client API keys for proxy auth (empty = open access) |
 | `HTTP_PROXY` | HTTP proxy for outbound requests |
+| `MAX_REQUEST_BODY_MB` | Client request body cap in MB (default 32) |
+| `FORCE_UPSTREAM_STREAM` | Always stream upstream and reassemble for non-stream clients (default `true`) |
+| `TOOL_CAMOUFLAGE` | Prefix tool names (`mcp__`) and append the `decide` signature tool on the wire (default `true`) |
+| `HARNESS_REWRITES` | Rewrite coding-harness markers in system prompts (default `true`) |
+| `BUFFY_GUARD` | Ensure the system prompt opens with the Buffy line the free tier requires (default `true`) |
+| `UPSTREAM_MIN_GAP` | Minimum gap between upstream calls per account (default `300ms`) |
 
 Environment variables override JSON values when both are set.
 

@@ -6,10 +6,17 @@ Freebuff2API 是 [Freebuff](https://freebuff.com) 的 OpenAI 兼容代理服务�
 
 ## 核心特性
 
-- **OpenAI 兼容 API** — 标准 OpenAI 端点，开箱即用，支持任意兼容客户端。
-- **高隐匿性请求处理** — 动态随机客户端特征标识，模拟官方 Freebuff SDK 行为模式。
-- **多 Token 轮换** — 支持多个认证 Token，内置定期自动轮换机制。
+- **OpenAI 兼容 API** — 标准 `/v1/chat/completions`、`/v1/models` 与 `/v1/responses`（Responses API）端点。
+- **Claude / Anthropic 兼容 API** — 完整的 `/v1/messages` 转换，含流式事件（`message_start` → `content_block_delta` → `message_stop`）、thinking 块、工具调用、图片，以及基于 tiktoken 的 `/v1/messages/count_tokens`。
+- **协议兼容层** — 自动补齐免费层要求的 Buffy 系统提示、工具集签名（工具名 `mcp__` 前缀 + `decide` 簽名工具）、harness 提示语改写、强制上游流式并在服务端重组响应、`cb_easp` 停止哨兵等。
+- **弹性会话处理** — 免费 Session 生命周期管理，含等待室轮询、`session_superseded` / `session_model_mismatch` / `model_locked` / 空流的自动恢复、基于 `retryAfterMs` 的 429 冷却解析，以及每账号熔断器。
+- **稳定账号身份** — 每个 Token 保持稳定的 `client_id`（与官方 SDK 格式一致），而非每次请求随机生成。
+- **单账号串行化** — 同一账号的上游请求串行执行并保持最小间隔，匹配免费层单并发行为。
+- **多 Token 轮换** — 支持多个认证 Token，自动定期轮换 Run 并平滑排水。
+- **动态模型目录** — 解析上游 freebuff 模型常量（`free-agents.ts`、`freebuff-models.ts`、`freebuff-model-ids.ts`），jsDelivr 镜像回退、6 小时刷新、按模型推理强度阶梯，内置快照兜底。
+- **健康检查端点** — `/healthz` 汇报每 Token 的会话状态、队列位置、配额档位与剩余额度、健康分类、冷却状态和模型目录状态。
 - **HTTP 代理支持** — 可为所有外部请求配置上游 HTTP 代理。
+- **Token 获取 CLI** — `cmd/freebuff-token` 完成设备码登录并将 Token 写入 `config.json`。
 
 ## 获取 Auth Token
 
@@ -52,6 +59,16 @@ npm i -g freebuff
 
 将 `authToken` 的值复制出来，即为所需的 **AUTH_TOKENS**。
 
+### 方式三 — 设备码登录 CLI
+
+使用内置 CLI 交互式登录，并直接写入配置文件：
+
+```bash
+go run ./cmd/freebuff-token --write-config
+```
+
+它会输出登录链接，等待你完成授权，然后将 Token 追加到 `config.json` 的 `AUTH_TOKENS` 中。
+
 > **提示：** 可登录多个账号并配置所有 Token，以提升并发吞吐量。
 
 ## 配置指南
@@ -61,12 +78,18 @@ npm i -g freebuff
 ```json
 {
   "LISTEN_ADDR": ":8080",
-  "UPSTREAM_BASE_URL": "https://codebuff.com",
+  "UPSTREAM_BASE_URL": "https://www.codebuff.com",
   "AUTH_TOKENS": ["token"],
   "ROTATION_INTERVAL": "6h",
   "REQUEST_TIMEOUT": "15m",
   "API_KEYS": [],
-  "HTTP_PROXY": ""
+  "HTTP_PROXY": "",
+  "MAX_REQUEST_BODY_MB": 32,
+  "FORCE_UPSTREAM_STREAM": true,
+  "TOOL_CAMOUFLAGE": true,
+  "HARNESS_REWRITES": true,
+  "BUFFY_GUARD": true,
+  "UPSTREAM_MIN_GAP": "300ms"
 }
 ```
 
@@ -75,12 +98,18 @@ npm i -g freebuff
 | 属性 / 环境变量 | 说明 |
 |---|---|
 | `LISTEN_ADDR` | 代理监听地址（默认 `:8080`） |
-| `UPSTREAM_BASE_URL` | Freebuff 后端地址（默认 `https://codebuff.com`） |
+| `UPSTREAM_BASE_URL` | Freebuff 后端地址（默认 `https://www.codebuff.com`） |
 | `AUTH_TOKENS` | Freebuff Auth Token（JSON 数组或逗号分隔的环境变量） |
 | `ROTATION_INTERVAL` | Run 自动轮换间隔（默认 `6h`） |
 | `REQUEST_TIMEOUT` | 上游请求超时时间（默认 `15m`） |
 | `API_KEYS` | 客户端鉴权 API Key（留空则无需鉴权） |
 | `HTTP_PROXY` | 上游 HTTP 代理地址 |
+| `MAX_REQUEST_BODY_MB` | 客户端请求体大小上限（MB，默认 32） |
+| `FORCE_UPSTREAM_STREAM` | 强制上游流式并为非流式客户端重组响应（默认 `true`） |
+| `TOOL_CAMOUFLAGE` | 上游侧工具名加 `mcp__` 前缀并追加 `decide` 簽名工具（默认 `true`） |
+| `HARNESS_REWRITES` | 改写系统提示中的 harness 标识短语（默认 `true`） |
+| `BUFFY_GUARD` | 确保系统提示以免费层要求的 Buffy 开头（默认 `true`） |
+| `UPSTREAM_MIN_GAP` | 单账号上游请求最小间隔（默认 `300ms`） |
 
 同时设置时，环境变量优先于 JSON 配置文件。
 
