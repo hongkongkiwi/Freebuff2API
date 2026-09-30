@@ -76,6 +76,19 @@ func atoiSubmatch(match []byte) int {
 	return value
 }
 
+// classifyForbidden maps a 403 body onto an account health classification.
+func classifyForbidden(body []byte) string {
+	lower := strings.ToLower(string(body))
+	switch {
+	case strings.Contains(lower, "banned"), strings.Contains(lower, "suspended"):
+		return healthBanned
+	case strings.Contains(lower, "country"), strings.Contains(lower, "region"), strings.Contains(lower, "geo"):
+		return healthCountryBlock
+	default:
+		return healthBlocked
+	}
+}
+
 type Server struct {
 	cfg      Config
 	logger   *log.Logger
@@ -549,8 +562,22 @@ func (s *Server) proxyChatRequest(
 		}
 
 		if resp.StatusCode == http.StatusUnauthorized {
+			lease.pool.setHealth(healthTokenInvalid)
 			s.runs.Cooldown(lease, 30*time.Minute, "upstream auth rejected token")
 			lease.pool.invalidateSession("upstream auth rejected token")
+			slotRelease()
+			s.runs.Release(lease)
+			writeUpstreamError(w, resp.StatusCode, errorBody)
+			return
+		}
+
+		if resp.StatusCode == http.StatusForbidden {
+			health := classifyForbidden(errorBody)
+			lease.pool.setHealth(health)
+			s.logger.Printf("%s: upstream rejected account (%s)", lease.pool.name, health)
+			if health == healthBanned || health == healthCountryBlock {
+				s.runs.Cooldown(lease, 24*time.Hour, "upstream rejected account: "+health)
+			}
 			slotRelease()
 			s.runs.Release(lease)
 			writeUpstreamError(w, resp.StatusCode, errorBody)
@@ -560,6 +587,7 @@ func (s *Server) proxyChatRequest(
 		if resp.StatusCode == http.StatusTooManyRequests {
 			cooldown := parseUpstreamCooldown(errorBody, resp.StatusCode)
 			s.logger.Printf("%s: rate limited by upstream, cooling down for %s", lease.pool.name, cooldown.Round(time.Second))
+			lease.pool.setHealth(healthRateLimited)
 			s.runs.Cooldown(lease, cooldown, fmt.Sprintf("rate limited by upstream (cooldown %s)", cooldown.Round(time.Second)))
 			lease.pool.invalidateSession("rate limited by upstream")
 			slotRelease()

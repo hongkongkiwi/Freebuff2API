@@ -36,6 +36,17 @@ type freeSessionResponse struct {
 	EstimatedWaitMs        int64  `json:"estimatedWaitMs"`
 	GracePeriodRemainingMs int64  `json:"gracePeriodRemainingMs"`
 	Message                string `json:"message"`
+	// Quota fields returned when the probe header is set; absent fields
+	// simply stay zero-valued.
+	AccessTier string                 `json:"accessTier"`
+	RateLimits []freeSessionRateLimit `json:"rateLimits"`
+}
+
+type freeSessionRateLimit struct {
+	Model     string `json:"model"`
+	Remaining int64  `json:"remaining"`
+	Limit     int64  `json:"limit"`
+	ResetAt   string `json:"resetAt"`
 }
 
 type cachedSession struct {
@@ -46,6 +57,8 @@ type cachedSession struct {
 	queueDepth int
 	pollAt     time.Time
 	retryAfter time.Duration
+	accessTier string
+	rateLimits []freeSessionRateLimit
 }
 
 func (p *tokenPool) ensureSession(ctx context.Context) (string, error) {
@@ -155,6 +168,8 @@ func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string,
 				status:     sessionStatusActive,
 				instanceID: instanceID,
 				expiresAt:  expiresAt,
+				accessTier: strings.TrimSpace(state.AccessTier),
+				rateLimits: state.RateLimits,
 			}, instanceID, nil
 		case sessionStatusQueued:
 			instanceID := strings.TrimSpace(state.InstanceID)
@@ -338,6 +353,9 @@ func (c *UpstreamClient) doSessionRequest(ctx context.Context, method, authToken
 	}
 	if method == http.MethodGet && instanceID != "" {
 		req.Header.Set("x-freebuff-instance-id", instanceID)
+		// Ask the upstream to include unused rate-limit info so the quota is
+		// observable without spending anything.
+		req.Header.Set("x-freebuff-include-unused-rate-limits", "1")
 	}
 
 	resp, err := c.httpClient.Do(req)

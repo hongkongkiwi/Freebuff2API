@@ -59,7 +59,21 @@ type tokenPool struct {
 	// request. nextChatAt is only touched while holding chatGate.
 	chatGate   chan struct{}
 	nextChatAt time.Time
+
+	// health classifies the account for operators: ok, token_invalid,
+	// rate_limited, banned, country_blocked, blocked.
+	health string
 }
+
+// Account health classifications surfaced in /healthz.
+const (
+	healthOK           = "ok"
+	healthTokenInvalid = "token_invalid"
+	healthRateLimited  = "rate_limited"
+	healthBanned       = "banned"
+	healthCountryBlock = "country_blocked"
+	healthBlocked      = "blocked"
+)
 
 // Circuit breaker: after this many consecutive upstream failures a pool is
 // cooled down so request routing moves to healthier accounts.
@@ -83,18 +97,21 @@ type runLease struct {
 }
 
 type tokenSnapshot struct {
-	Name              string        `json:"name"`
-	Runs              []runSnapshot `json:"runs"`
-	DrainingRuns      int           `json:"draining_runs"`
-	SessionStatus     string        `json:"session_status,omitempty"`
-	SessionInstanceID string        `json:"session_instance_id,omitempty"`
-	SessionExpiresAt  time.Time     `json:"session_expires_at,omitempty"`
-	SessionPosition   int           `json:"session_position,omitempty"`
-	SessionQueueDepth int           `json:"session_queue_depth,omitempty"`
-	SessionPollAt     time.Time     `json:"session_poll_at,omitempty"`
-	CooldownUntil     time.Time     `json:"cooldown_until,omitempty"`
-	ConsecFailures    int           `json:"consecutive_failures,omitempty"`
-	LastError         string        `json:"last_error,omitempty"`
+	Name              string                 `json:"name"`
+	Health            string                 `json:"health"`
+	Runs              []runSnapshot          `json:"runs"`
+	DrainingRuns      int                    `json:"draining_runs"`
+	SessionStatus     string                 `json:"session_status,omitempty"`
+	SessionInstanceID string                 `json:"session_instance_id,omitempty"`
+	SessionExpiresAt  time.Time              `json:"session_expires_at,omitempty"`
+	SessionPosition   int                    `json:"session_position,omitempty"`
+	SessionQueueDepth int                    `json:"session_queue_depth,omitempty"`
+	SessionPollAt     time.Time              `json:"session_poll_at,omitempty"`
+	SessionAccessTier string                 `json:"session_access_tier,omitempty"`
+	RateLimits        []freeSessionRateLimit `json:"rate_limits,omitempty"`
+	CooldownUntil     time.Time              `json:"cooldown_until,omitempty"`
+	ConsecFailures    int                    `json:"consecutive_failures,omitempty"`
+	LastError         string                 `json:"last_error,omitempty"`
 }
 
 type runSnapshot struct {
@@ -511,6 +528,14 @@ func (p *tokenPool) markCooldown(duration time.Duration, reason string) {
 func (p *tokenPool) reportSuccess() {
 	p.mu.Lock()
 	p.consecFailures = 0
+	p.health = healthOK
+	p.mu.Unlock()
+}
+
+// setHealth records an account health classification for /healthz.
+func (p *tokenPool) setHealth(health string) {
+	p.mu.Lock()
+	p.health = health
 	p.mu.Unlock()
 }
 
@@ -574,10 +599,14 @@ func (p *tokenPool) snapshot() tokenSnapshot {
 
 	snapshot := tokenSnapshot{
 		Name:           p.name,
+		Health:         p.health,
 		DrainingRuns:   len(p.draining),
 		CooldownUntil:  p.cooldownUntil,
 		ConsecFailures: p.consecFailures,
 		LastError:      p.lastError,
+	}
+	if snapshot.Health == "" {
+		snapshot.Health = healthOK
 	}
 	if p.session != nil {
 		snapshot.SessionStatus = string(p.session.status)
@@ -586,6 +615,8 @@ func (p *tokenPool) snapshot() tokenSnapshot {
 		snapshot.SessionPosition = p.session.position
 		snapshot.SessionQueueDepth = p.session.queueDepth
 		snapshot.SessionPollAt = p.session.pollAt
+		snapshot.SessionAccessTier = p.session.accessTier
+		snapshot.RateLimits = p.session.rateLimits
 	}
 	for agentID, run := range p.runs {
 		snapshot.Runs = append(snapshot.Runs, runSnapshot{
