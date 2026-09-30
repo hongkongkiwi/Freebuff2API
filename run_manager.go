@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type RunManager struct {
@@ -27,6 +29,13 @@ type tokenPool struct {
 	cfg    Config
 	client *UpstreamClient
 	logger *log.Logger
+
+	// clientID is a stable per-account identity matching the official SDK's
+	// client session id format. Regenerating it per request would make every
+	// call look like a brand-new client.
+	clientID string
+	// traceSessionID is a per-account trace marker regenerated on run rotation.
+	traceSessionID string
 
 	mu               sync.Mutex
 	runs             map[string]*managedRun // agentID -> current run
@@ -106,12 +115,14 @@ func NewRunManager(cfg Config, client *UpstreamClient, logger *log.Logger) *RunM
 	pools := make([]*tokenPool, 0, len(cfg.AuthTokens))
 	for index, token := range cfg.AuthTokens {
 		pools = append(pools, &tokenPool{
-			name:   fmt.Sprintf("token-%d", index+1),
-			token:  token,
-			cfg:    cfg,
-			client: client,
-			runs:   make(map[string]*managedRun),
-			logger: logger,
+			name:           fmt.Sprintf("token-%d", index+1),
+			token:          token,
+			cfg:            cfg,
+			client:         client,
+			runs:           make(map[string]*managedRun),
+			logger:         logger,
+			clientID:       generateClientSessionId(),
+			traceSessionID: uuid.NewString(),
 		})
 	}
 
@@ -357,6 +368,7 @@ func (p *tokenPool) rotateAgent(ctx context.Context, agentID string) error {
 		startedAt: time.Now(),
 	}
 	p.lastError = ""
+	p.traceSessionID = uuid.NewString()
 	if oldRun != nil {
 		p.draining = append(p.draining, oldRun)
 	}
@@ -456,6 +468,14 @@ func (p *tokenPool) markCooldown(duration time.Duration, reason string) {
 	if reason != "" {
 		p.lastError = reason
 	}
+}
+
+// traceSession returns the pool's current trace marker; regenerated on run
+// rotation, so read it under the pool lock.
+func (p *tokenPool) traceSession() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.traceSessionID
 }
 
 func (p *tokenPool) snapshot() tokenSnapshot {

@@ -27,6 +27,10 @@ var passthroughHeaders = map[string]bool{
 	"X-Request-Id":  true,
 }
 
+// defaultUpstreamStop is the stop sentinel the free-tier backend expects when
+// the client did not provide one (a JSON string containing double quotes).
+const defaultUpstreamStop = "\"cb_easp\""
+
 type Server struct {
 	cfg      Config
 	logger   *log.Logger
@@ -356,7 +360,7 @@ func (s *Server) proxyChatRequest(
 			return
 		}
 
-		upstreamBody, err := s.injectUpstreamMetadata(payload, requestedModel, lease.run.id, sessionInstanceID)
+		upstreamBody, err := s.injectUpstreamMetadata(lease.pool, payload, requestedModel, lease.run.id, sessionInstanceID)
 		if err != nil {
 			s.runs.Release(lease)
 			writeError(w, http.StatusBadRequest, err.Error(), invalidRequestType, "")
@@ -414,7 +418,7 @@ func writeOpenAISuccessResponse(w http.ResponseWriter, resp *http.Response) erro
 	return copyResponseBody(w, resp.Body)
 }
 
-func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, runID, sessionInstanceID string) ([]byte, error) {
+func (s *Server) injectUpstreamMetadata(pool *tokenPool, payload map[string]any, requestedModel, runID, sessionInstanceID string) ([]byte, error) {
 	cloned := cloneMap(payload)
 	cloned["model"] = requestedModel
 
@@ -425,13 +429,20 @@ func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, 
 		normalizeToolSchemas(tools)
 	}
 
+	// Defaults the free-tier backend expects; clients usually omit them.
+	if value, ok := cloned["stop"]; !ok || value == nil {
+		cloned["stop"] = []any{defaultUpstreamStop}
+	}
+	cloned["provider"] = map[string]any{"data_collection": "deny"}
+
 	metadata, ok := cloned["codebuff_metadata"].(map[string]any)
 	if !ok || metadata == nil {
 		metadata = make(map[string]any)
 	}
 	metadata["run_id"] = runID
 	metadata["cost_mode"] = "free"
-	metadata["client_id"] = generateClientSessionId()
+	metadata["client_id"] = pool.clientID
+	metadata["trace_session_id"] = pool.traceSession()
 	if strings.TrimSpace(sessionInstanceID) != "" {
 		metadata["freebuff_instance_id"] = sessionInstanceID
 	}
