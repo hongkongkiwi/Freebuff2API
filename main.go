@@ -36,7 +36,7 @@ func main() {
 		transport.Proxy = http.ProxyURL(importURL)
 	}
 	httpClient := &http.Client{Transport: transport, Timeout: 15 * time.Second}
-	
+
 	registry := NewModelRegistry(httpClient, logger)
 	registry.Start(context.Background())
 	defer registry.Stop()
