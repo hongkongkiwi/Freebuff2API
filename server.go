@@ -10,6 +10,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -30,6 +32,58 @@ var passthroughHeaders = map[string]bool{
 // defaultUpstreamStop is the stop sentinel the free-tier backend expects when
 // the client did not provide one (a JSON string containing double quotes).
 const defaultUpstreamStop = "\"cb_easp\""
+
+// maxProxyAttempts bounds session/run-invalid retries and cross-pool failover
+// for a single client request.
+const maxProxyAttempts = 3
+
+var (
+	retryAfterMsPattern = regexp.MustCompile(`"retryAfterMs"\s*:\s*(\d+)`)
+	tryAgainTextPattern = regexp.MustCompile(`(?i)try again in(?:\s+(\d+)\s*h)?(?:\s+(\d+)\s*m)?(?:\s+(\d+)\s*s)?`)
+)
+
+const (
+	defaultRateLimitCooldown = 5 * time.Minute
+	otherErrorCooldown       = time.Minute
+	maxUpstreamCooldown      = 6 * time.Hour
+)
+
+// parseUpstreamCooldown extracts a pool cooldown from a rate-limit error body:
+// a retryAfterMs field, a "try again in Xh Ym Zs" hint, or a status default.
+func parseUpstreamCooldown(body []byte, status int) time.Duration {
+	if match := retryAfterMsPattern.FindSubmatch(body); match != nil {
+		if ms, err := strconv.ParseInt(string(match[1]), 10, 64); err == nil && ms > 0 {
+			return clampCooldown(time.Duration(ms) * time.Millisecond)
+		}
+	}
+	if match := tryAgainTextPattern.FindSubmatch(body); match != nil {
+		hours := atoiSubmatch(match[1])
+		minutes := atoiSubmatch(match[2])
+		seconds := atoiSubmatch(match[3])
+		if total := time.Duration(hours)*time.Hour + time.Duration(minutes)*time.Minute + time.Duration(seconds)*time.Second; total > 0 {
+			return clampCooldown(total)
+		}
+	}
+	if status == http.StatusTooManyRequests {
+		return defaultRateLimitCooldown
+	}
+	return otherErrorCooldown
+}
+
+func clampCooldown(d time.Duration) time.Duration {
+	if d > maxUpstreamCooldown {
+		return maxUpstreamCooldown
+	}
+	if d <= 0 {
+		return defaultRateLimitCooldown
+	}
+	return d
+}
+
+func atoiSubmatch(match []byte) int {
+	value, _ := strconv.Atoi(string(match))
+	return value
+}
 
 type Server struct {
 	cfg      Config
@@ -322,13 +376,32 @@ func (s *Server) proxyChatRequest(
 ) {
 	startTime := time.Now()
 
+	var lastUpstreamErrStatus int
+	var lastUpstreamErrBody []byte
+	recordUpstreamError := func(status int, body []byte) {
+		lastUpstreamErrStatus = status
+		lastUpstreamErrBody = body
+	}
+	// surfaceUpstreamError re-emits the most recent upstream error (with its
+	// Retry-After) when retrying on other pools did not produce a response.
+	surfaceUpstreamError := func() bool {
+		if lastUpstreamErrStatus == 0 {
+			return false
+		}
+		if cooldown := parseUpstreamCooldown(lastUpstreamErrBody, lastUpstreamErrStatus); cooldown > 0 {
+			w.Header().Set("Retry-After", fmt.Sprintf("%.0f", cooldown.Seconds()))
+		}
+		writeUpstreamError(w, lastUpstreamErrStatus, lastUpstreamErrBody)
+		return true
+	}
+
 	agentID, ok := s.registry.AgentForModel(requestedModel)
 	if !ok {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("unsupported model %q", requestedModel), invalidRequestType, "model_not_found")
 		return
 	}
 
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < maxProxyAttempts; attempt++ {
 		lease, err := s.runs.Acquire(r.Context(), agentID)
 		if err != nil {
 			var waitingErr *waitingRoomError
@@ -337,6 +410,9 @@ func (s *Server) proxyChatRequest(
 					w.Header().Set("Retry-After", fmt.Sprintf("%.0f", waitingErr.RetryAfter.Seconds()))
 				}
 				writeError(w, http.StatusServiceUnavailable, waitingErr.Error(), serverErrorType, "waiting_room_queued")
+				return
+			}
+			if surfaceUpstreamError() {
 				return
 			}
 			writeError(w, http.StatusBadGateway, "no healthy upstream auth token available", serverErrorType, "")
@@ -376,6 +452,7 @@ func (s *Server) proxyChatRequest(
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			defer resp.Body.Close()
+			s.runs.ReportSuccess(lease)
 			if err := writeSuccess(w, resp); err != nil && !errors.Is(err, context.Canceled) {
 				s.logger.Printf("[%s] proxy response copy failed: %v", lease.pool.name, err)
 			}
@@ -401,7 +478,23 @@ func (s *Server) proxyChatRequest(
 		if resp.StatusCode == http.StatusUnauthorized {
 			s.runs.Cooldown(lease, 30*time.Minute, "upstream auth rejected token")
 			lease.pool.invalidateSession("upstream auth rejected token")
+			s.runs.Release(lease)
+			writeUpstreamError(w, resp.StatusCode, errorBody)
+			return
 		}
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			cooldown := parseUpstreamCooldown(errorBody, resp.StatusCode)
+			s.logger.Printf("%s: rate limited by upstream, cooling down for %s", lease.pool.name, cooldown.Round(time.Second))
+			s.runs.Cooldown(lease, cooldown, fmt.Sprintf("rate limited by upstream (cooldown %s)", cooldown.Round(time.Second)))
+			lease.pool.invalidateSession("rate limited by upstream")
+			s.runs.Release(lease)
+			recordUpstreamError(resp.StatusCode, errorBody)
+			continue
+		}
+
+		// Any other upstream failure counts toward the per-pool circuit breaker.
+		s.runs.ReportFailure(lease, fmt.Sprintf("upstream status %d", resp.StatusCode))
 
 		s.runs.Release(lease)
 		s.logger.Printf("[%s] upstream error response: %s", lease.pool.name, string(errorBody))
@@ -409,7 +502,7 @@ func (s *Server) proxyChatRequest(
 		return
 	}
 
-	writeError(w, http.StatusBadGateway, "upstream run expired twice in a row", serverErrorType, "")
+	surfaceUpstreamError()
 }
 
 func writeOpenAISuccessResponse(w http.ResponseWriter, resp *http.Response) error {
@@ -466,7 +559,7 @@ func isSessionInvalid(statusCode int, errorBody []byte) bool {
 		return false
 	}
 	switch strings.TrimSpace(payload.Error) {
-	case "freebuff_update_required", "waiting_room_required", "waiting_room_queued", "session_superseded", "session_expired":
+	case "freebuff_update_required", "waiting_room_required", "waiting_room_queued", "session_superseded", "session_expired", "session_model_mismatch", "model_locked":
 		return true
 	default:
 		return false

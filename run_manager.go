@@ -44,7 +44,15 @@ type tokenPool struct {
 	sessionRefreshCh chan struct{}
 	lastError        string
 	cooldownUntil    time.Time
+	consecFailures   int
 }
+
+// Circuit breaker: after this many consecutive upstream failures a pool is
+// cooled down so request routing moves to healthier accounts.
+const (
+	breakerThreshold = 3
+	breakerCooldown  = 30 * time.Minute
+)
 
 type managedRun struct {
 	id           string
@@ -71,6 +79,7 @@ type tokenSnapshot struct {
 	SessionQueueDepth int           `json:"session_queue_depth,omitempty"`
 	SessionPollAt     time.Time     `json:"session_poll_at,omitempty"`
 	CooldownUntil     time.Time     `json:"cooldown_until,omitempty"`
+	ConsecFailures    int           `json:"consecutive_failures,omitempty"`
 	LastError         string        `json:"last_error,omitempty"`
 }
 
@@ -246,6 +255,20 @@ func (m *RunManager) Cooldown(lease *runLease, duration time.Duration, reason st
 		return
 	}
 	lease.pool.markCooldown(duration, reason)
+}
+
+func (m *RunManager) ReportSuccess(lease *runLease) {
+	if lease == nil || lease.pool == nil {
+		return
+	}
+	lease.pool.reportSuccess()
+}
+
+func (m *RunManager) ReportFailure(lease *runLease, reason string) {
+	if lease == nil || lease.pool == nil {
+		return
+	}
+	lease.pool.reportFailure(reason)
 }
 
 func (m *RunManager) Snapshots() []tokenSnapshot {
@@ -470,6 +493,27 @@ func (p *tokenPool) markCooldown(duration time.Duration, reason string) {
 	}
 }
 
+func (p *tokenPool) reportSuccess() {
+	p.mu.Lock()
+	p.consecFailures = 0
+	p.mu.Unlock()
+}
+
+func (p *tokenPool) reportFailure(reason string) {
+	p.mu.Lock()
+	p.consecFailures++
+	failures := p.consecFailures
+	p.mu.Unlock()
+
+	if failures < breakerThreshold {
+		return
+	}
+	p.markCooldown(breakerCooldown, fmt.Sprintf("circuit breaker tripped after %d consecutive upstream failures (last: %s)", failures, reason))
+	p.mu.Lock()
+	p.consecFailures = 0
+	p.mu.Unlock()
+}
+
 // traceSession returns the pool's current trace marker; regenerated on run
 // rotation, so read it under the pool lock.
 func (p *tokenPool) traceSession() string {
@@ -483,10 +527,11 @@ func (p *tokenPool) snapshot() tokenSnapshot {
 	defer p.mu.Unlock()
 
 	snapshot := tokenSnapshot{
-		Name:          p.name,
-		DrainingRuns:  len(p.draining),
-		CooldownUntil: p.cooldownUntil,
-		LastError:     p.lastError,
+		Name:           p.name,
+		DrainingRuns:   len(p.draining),
+		CooldownUntil:  p.cooldownUntil,
+		ConsecFailures: p.consecFailures,
+		LastError:      p.lastError,
 	}
 	if p.session != nil {
 		snapshot.SessionStatus = string(p.session.status)
