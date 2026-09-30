@@ -59,11 +59,21 @@ func loadConfig(configPath string) (Config, error) {
 	overrideCSV(&cfg.AuthTokens, "AUTH_TOKENS")
 	overrideCSV(&cfg.APIKeys, "API_KEYS")
 	overrideString(&cfg.HTTPProxy, "HTTP_PROXY")
-	overrideInt(&cfg.MaxRequestBodyMB, "MAX_REQUEST_BODY_MB")
-	overrideBool(&cfg.ForceUpstreamStream, "FORCE_UPSTREAM_STREAM")
-	overrideBool(&cfg.ToolCamouflage, "TOOL_CAMOUFLAGE")
-	overrideBool(&cfg.HarnessRewrites, "HARNESS_REWRITES")
-	overrideBool(&cfg.BuffyGuard, "BUFFY_GUARD")
+	if err := overrideInt(&cfg.MaxRequestBodyMB, "MAX_REQUEST_BODY_MB"); err != nil {
+		return Config{}, err
+	}
+	if err := overrideBool(&cfg.ForceUpstreamStream, "FORCE_UPSTREAM_STREAM"); err != nil {
+		return Config{}, err
+	}
+	if err := overrideBool(&cfg.ToolCamouflage, "TOOL_CAMOUFLAGE"); err != nil {
+		return Config{}, err
+	}
+	if err := overrideBool(&cfg.HarnessRewrites, "HARNESS_REWRITES"); err != nil {
+		return Config{}, err
+	}
+	if err := overrideBool(&cfg.BuffyGuard, "BUFFY_GUARD"); err != nil {
+		return Config{}, err
+	}
 	overrideString(&cfg.UpstreamMinGap, "UPSTREAM_MIN_GAP")
 
 	rotationInterval, err := time.ParseDuration(strings.TrimSpace(cfg.RotationInterval))
@@ -173,28 +183,37 @@ func overrideString(target *string, envName string) {
 	}
 }
 
-func overrideInt(target *int, envName string) {
+// overrideInt applies an integer env override, failing loudly on malformed
+// values so a typo cannot silently leave the configured default in effect.
+func overrideInt(target *int, envName string) error {
 	value := strings.TrimSpace(os.Getenv(envName))
 	if value == "" {
-		return
+		return nil
 	}
 	parsed, err := strconv.Atoi(value)
-	if err != nil || parsed < 0 {
-		return
+	if err != nil {
+		return fmt.Errorf("invalid %s=%q: must be an integer", envName, value)
+	}
+	if parsed < 0 {
+		return fmt.Errorf("invalid %s=%d: cannot be negative", envName, parsed)
 	}
 	*target = parsed
+	return nil
 }
 
-func overrideBool(target *bool, envName string) {
+// overrideBool applies a boolean env override, failing loudly on malformed
+// values so a typo cannot silently leave the configured default in effect.
+func overrideBool(target *bool, envName string) error {
 	value := strings.TrimSpace(os.Getenv(envName))
 	if value == "" {
-		return
+		return nil
 	}
 	parsed, err := strconv.ParseBool(value)
 	if err != nil {
-		return
+		return fmt.Errorf("invalid %s=%q: must be a boolean (true/false/1/0)", envName, value)
 	}
 	*target = parsed
+	return nil
 }
 
 func overrideCSV(target *[]string, envName string) {

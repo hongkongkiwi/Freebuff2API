@@ -65,7 +65,10 @@ func main() {
 	fmt.Println("2. Authorize the CLI with your Google account.")
 	fmt.Printf("3. Waiting for authorization (up to %s)...\n", *timeout)
 
-	authToken, email := pollForToken(client, *baseURL, *fingerprint, codeResp, *timeout)
+	authToken, email, err := pollForToken(client, *baseURL, *fingerprint, codeResp, *timeout, 2*time.Second)
+	if err != nil {
+		fatalf("%v", err)
+	}
 
 	fmt.Println()
 	fmt.Printf("Login succeeded for %s\n", email)
@@ -121,35 +124,84 @@ func postCliCode(client *http.Client, baseURL, fingerprint string) (*cliCodeResp
 	return &parsed, nil
 }
 
-func pollForToken(client *http.Client, baseURL, fingerprint string, code *cliCodeResponse, timeout time.Duration) (string, string) {
+// maxStatusBody caps how much of a status poll response is read into memory.
+const maxStatusBody = 64 << 10
+
+// pollForToken polls the authorization status until the user completes the
+// login, the server-side code expires, or the local timeout elapses.
+// Transient failures are reported once per distinct reason instead of being
+// swallowed silently.
+func pollForToken(client *http.Client, baseURL, fingerprint string, code *cliCodeResponse, timeout, pollInterval time.Duration) (string, string, error) {
 	requestURL, err := url.JoinPath(baseURL, "/api/auth/cli/status")
 	if err != nil {
-		fatalf("build status URL: %v", err)
+		return "", "", err
 	}
 
 	deadline := time.Now().Add(timeout)
-	for attempt := 1; time.Now().Before(deadline); attempt++ {
+	// The server-side login code has its own lifetime; never poll past it
+	// (and refuse immediately when it is already expired).
+	if expiresAt, parseErr := time.Parse(time.RFC3339, strings.TrimSpace(code.ExpiresAt)); parseErr == nil {
+		if time.Now().After(expiresAt) {
+			return "", "", fmt.Errorf("login code already expired at %s", expiresAt.Format(time.RFC3339))
+		}
+		if expiresAt.Before(deadline) {
+			deadline = expiresAt
+			fmt.Printf("   (login code expires at %s)\n", expiresAt.Local().Format("15:04:05"))
+		}
+	}
+
+	lastReason := ""
+	reportReason := func(reason string) {
+		if reason != lastReason {
+			fmt.Printf("   (waiting: %s)\n", reason)
+			lastReason = reason
+		}
+	}
+
+	for time.Now().Before(deadline) {
 		statusURL := fmt.Sprintf("%s?fingerprintId=%s&fingerprintHash=%s&expiresAt=%s",
 			requestURL,
 			url.QueryEscape(fingerprint),
 			url.QueryEscape(code.FingerprintHash),
 			url.QueryEscape(code.ExpiresAt),
 		)
-		resp, err := client.Get(statusURL)
-		if err == nil {
-			data, readErr := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if readErr == nil && resp.StatusCode == http.StatusOK {
-				var parsed cliStatusResponse
-				if json.Unmarshal(data, &parsed) == nil && parsed.User != nil && parsed.User.AuthToken != "" {
-					return parsed.User.AuthToken, parsed.User.Email
-				}
-			}
+		resp, reqErr := client.Get(statusURL)
+		if reqErr != nil {
+			reportReason(fmt.Sprintf("network error: %v", reqErr))
+			time.Sleep(pollInterval)
+			continue
 		}
-		time.Sleep(2 * time.Second)
+		data, readErr := io.ReadAll(io.LimitReader(resp.Body, maxStatusBody))
+		resp.Body.Close()
+		if readErr != nil {
+			reportReason(fmt.Sprintf("read status response: %v", readErr))
+			time.Sleep(pollInterval)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			reportReason(fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data))))
+			time.Sleep(pollInterval)
+			continue
+		}
+		var parsed cliStatusResponse
+		if err := json.Unmarshal(data, &parsed); err != nil {
+			reportReason("unparseable status response")
+			time.Sleep(pollInterval)
+			continue
+		}
+		if parsed.User == nil {
+			// Expected while waiting for the user to authorize; stay quiet.
+			time.Sleep(pollInterval)
+			continue
+		}
+		if parsed.User.AuthToken == "" {
+			reportReason("user returned without an authToken")
+			time.Sleep(pollInterval)
+			continue
+		}
+		return parsed.User.AuthToken, parsed.User.Email, nil
 	}
-	fatalf("timed out waiting for authorization")
-	return "", ""
+	return "", "", fmt.Errorf("timed out waiting for authorization")
 }
 
 // appendTokenToConfig adds the token to the AUTH_TOKENS array of a JSON config,

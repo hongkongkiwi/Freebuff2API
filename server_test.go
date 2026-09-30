@@ -737,3 +737,27 @@ func TestClaudeNonStreamKeepsThinkingBlocks(t *testing.T) {
 		t.Fatalf("reasoning was promoted to text instead of a thinking block: %v", message["content"])
 	}
 }
+
+func TestAccumulatorFinalizeToolCallsHaveNoIndexField(t *testing.T) {
+	// Non-streaming chat.completion tool_calls carry no index (that field
+	// exists only on streaming deltas); strict validators reject it.
+	acc := newChatCompletionAccumulator()
+	chunk := accumulatorChunk(`{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":"{}"}}]},"finish_reason":"tool_calls"}`)
+	if err := acc.ingest(chunk); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	final := acc.finalize()
+	message := finalizedMessage(t, final)
+	for _, rawCall := range message["tool_calls"].([]any) {
+		call := rawCall.(map[string]any)
+		if _, present := call["index"]; present {
+			t.Fatalf("tool_call carries a streaming-only index field: %v", call)
+		}
+		for _, key := range []string{"id", "type", "function"} {
+			if _, present := call[key]; !present {
+				t.Fatalf("tool_call missing %q: %v", key, call)
+			}
+		}
+	}
+}
