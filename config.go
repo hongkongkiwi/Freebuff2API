@@ -26,6 +26,7 @@ type Config struct {
 	ForceUpstreamStream bool
 	ToolCamouflage      bool
 	HarnessRewrites     bool
+	BuffyGuard          bool
 }
 
 type rawConfig struct {
@@ -40,6 +41,7 @@ type rawConfig struct {
 	ForceUpstreamStream bool     `json:"FORCE_UPSTREAM_STREAM"`
 	ToolCamouflage      bool     `json:"TOOL_CAMOUFLAGE"`
 	HarnessRewrites     bool     `json:"HARNESS_REWRITES"`
+	BuffyGuard          bool     `json:"BUFFY_GUARD"`
 }
 
 func loadConfig(configPath string) (Config, error) {
@@ -59,6 +61,7 @@ func loadConfig(configPath string) (Config, error) {
 	overrideBool(&cfg.ForceUpstreamStream, "FORCE_UPSTREAM_STREAM")
 	overrideBool(&cfg.ToolCamouflage, "TOOL_CAMOUFLAGE")
 	overrideBool(&cfg.HarnessRewrites, "HARNESS_REWRITES")
+	overrideBool(&cfg.BuffyGuard, "BUFFY_GUARD")
 
 	rotationInterval, err := time.ParseDuration(strings.TrimSpace(cfg.RotationInterval))
 	if err != nil {
@@ -83,6 +86,7 @@ func loadConfig(configPath string) (Config, error) {
 		ForceUpstreamStream: cfg.ForceUpstreamStream,
 		ToolCamouflage:      cfg.ToolCamouflage,
 		HarnessRewrites:     cfg.HarnessRewrites,
+		BuffyGuard:          cfg.BuffyGuard,
 	}
 
 	switch {
@@ -128,6 +132,7 @@ func loadRawConfig(configPath string) (rawConfig, error) {
 		ForceUpstreamStream: true,
 		ToolCamouflage:      true,
 		HarnessRewrites:     true,
+		BuffyGuard:          true,
 	}
 
 	if configPath != "" {

@@ -574,6 +574,9 @@ func (s *Server) injectUpstreamMetadata(pool *tokenPool, payload map[string]any,
 	if s.cfg.HarnessRewrites {
 		rewriteHarnessPrompts(cloned)
 	}
+	if s.cfg.BuffyGuard {
+		ensureBuffySystemPrompt(cloned)
+	}
 	if s.cfg.ForceUpstreamStream {
 		forceUpstreamStreaming(cloned)
 	}
