@@ -5,12 +5,20 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
+)
+
+// Spacing enforced between upstream chat calls on one account: the free tier
+// breaks when a single account runs concurrent requests.
+const (
+	defaultUpstreamGap       = 300 * time.Millisecond
+	defaultUpstreamGapJitter = 1200 * time.Millisecond
 )
 
 type RunManager struct {
@@ -45,6 +53,12 @@ type tokenPool struct {
 	lastError        string
 	cooldownUntil    time.Time
 	consecFailures   int
+
+	// chatGate serializes upstream chat calls per account (capacity 1); the
+	// free channel misbehaves when one account has more than one in-flight
+	// request. nextChatAt is only touched while holding chatGate.
+	chatGate   chan struct{}
+	nextChatAt time.Time
 }
 
 // Circuit breaker: after this many consecutive upstream failures a pool is
@@ -132,6 +146,7 @@ func NewRunManager(cfg Config, client *UpstreamClient, logger *log.Logger) *RunM
 			logger:         logger,
 			clientID:       generateClientSessionId(),
 			traceSessionID: uuid.NewString(),
+			chatGate:       make(chan struct{}, 1),
 		})
 	}
 
@@ -520,6 +535,37 @@ func (p *tokenPool) traceSession() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.traceSessionID
+}
+
+// acquireChatSlot reserves the pool's single upstream chat slot and waits out
+// the minimum gap since the previous call. The returned release func must be
+// called once the upstream response has been fully handled.
+func (p *tokenPool) acquireChatSlot(ctx context.Context) (func(), error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case p.chatGate <- struct{}{}:
+	}
+
+	if wait := time.Until(p.nextChatAt); wait > 0 {
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			<-p.chatGate
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+
+	gap := p.cfg.UpstreamMinGap
+	if gap <= 0 {
+		gap = defaultUpstreamGap
+	}
+	jitter := time.Duration(rand.Int63n(int64(defaultUpstreamGapJitter)))
+	p.nextChatAt = time.Now().Add(gap + jitter)
+
+	return func() { <-p.chatGate }, nil
 }
 
 func (p *tokenPool) snapshot() tokenSnapshot {

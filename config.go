@@ -27,6 +27,7 @@ type Config struct {
 	ToolCamouflage      bool
 	HarnessRewrites     bool
 	BuffyGuard          bool
+	UpstreamMinGap      time.Duration
 }
 
 type rawConfig struct {
@@ -42,6 +43,7 @@ type rawConfig struct {
 	ToolCamouflage      bool     `json:"TOOL_CAMOUFLAGE"`
 	HarnessRewrites     bool     `json:"HARNESS_REWRITES"`
 	BuffyGuard          bool     `json:"BUFFY_GUARD"`
+	UpstreamMinGap      string   `json:"UPSTREAM_MIN_GAP"`
 }
 
 func loadConfig(configPath string) (Config, error) {
@@ -62,6 +64,7 @@ func loadConfig(configPath string) (Config, error) {
 	overrideBool(&cfg.ToolCamouflage, "TOOL_CAMOUFLAGE")
 	overrideBool(&cfg.HarnessRewrites, "HARNESS_REWRITES")
 	overrideBool(&cfg.BuffyGuard, "BUFFY_GUARD")
+	overrideString(&cfg.UpstreamMinGap, "UPSTREAM_MIN_GAP")
 
 	rotationInterval, err := time.ParseDuration(strings.TrimSpace(cfg.RotationInterval))
 	if err != nil {
@@ -71,6 +74,17 @@ func loadConfig(configPath string) (Config, error) {
 	requestTimeout, err := time.ParseDuration(strings.TrimSpace(cfg.RequestTimeout))
 	if err != nil {
 		return Config{}, fmt.Errorf("parse request timeout: %w", err)
+	}
+
+	upstreamMinGap := defaultUpstreamGap
+	if strings.TrimSpace(cfg.UpstreamMinGap) != "" {
+		upstreamMinGap, err = time.ParseDuration(strings.TrimSpace(cfg.UpstreamMinGap))
+		if err != nil {
+			return Config{}, fmt.Errorf("parse upstream min gap: %w", err)
+		}
+		if upstreamMinGap < 0 {
+			return Config{}, errors.New("UPSTREAM_MIN_GAP cannot be negative")
+		}
 	}
 
 	finalCfg := Config{
@@ -87,6 +101,7 @@ func loadConfig(configPath string) (Config, error) {
 		ToolCamouflage:      cfg.ToolCamouflage,
 		HarnessRewrites:     cfg.HarnessRewrites,
 		BuffyGuard:          cfg.BuffyGuard,
+		UpstreamMinGap:      upstreamMinGap,
 	}
 
 	switch {

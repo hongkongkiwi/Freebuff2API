@@ -438,8 +438,18 @@ func (s *Server) proxyChatRequest(
 			return
 		}
 
+		// One in-flight upstream chat per account: wait for this pool's slot
+		// and the minimum inter-call gap before touching the upstream.
+		slotRelease, err := lease.pool.acquireChatSlot(r.Context())
+		if err != nil {
+			s.runs.Release(lease)
+			writeError(w, http.StatusGatewayTimeout, "timed out waiting for the account's upstream slot", serverErrorType, "")
+			return
+		}
+
 		resp, errorBody, err := s.client.ChatCompletions(r.Context(), lease.pool.token, upstreamBody)
 		if err != nil {
+			slotRelease()
 			s.runs.Release(lease)
 			writeError(w, http.StatusBadGateway, err.Error(), serverErrorType, "")
 			return
@@ -451,6 +461,7 @@ func (s *Server) proxyChatRequest(
 			if closeErr := resp.Body.Close(); closeErr != nil {
 				s.logger.Printf("[%s] upstream body close failed: %v", lease.pool.name, closeErr)
 			}
+			slotRelease()
 			if errors.Is(writeErr, errBlankUpstreamStream) && attempt < maxProxyAttempts-1 {
 				s.logger.Printf("[%s] upstream returned a blank stream, refreshing session and retrying", lease.pool.name)
 				lease.pool.invalidateSession("blank upstream stream")
@@ -468,6 +479,7 @@ func (s *Server) proxyChatRequest(
 		if isSessionInvalid(resp.StatusCode, errorBody) {
 			s.logger.Printf("%s: free session invalid, refreshing and retrying", lease.pool.name)
 			lease.pool.invalidateSession(strings.TrimSpace(string(errorBody)))
+			slotRelease()
 			s.runs.Release(lease)
 			continue
 		}
@@ -475,6 +487,7 @@ func (s *Server) proxyChatRequest(
 		if isRunInvalid(resp.StatusCode, errorBody) {
 			s.logger.Printf("%s: run %s invalid, rotating and retrying", lease.pool.name, lease.run.id)
 			s.runs.Invalidate(lease, strings.TrimSpace(string(errorBody)))
+			slotRelease()
 			s.runs.Release(lease)
 			continue
 		}
@@ -482,6 +495,7 @@ func (s *Server) proxyChatRequest(
 		if resp.StatusCode == http.StatusUnauthorized {
 			s.runs.Cooldown(lease, 30*time.Minute, "upstream auth rejected token")
 			lease.pool.invalidateSession("upstream auth rejected token")
+			slotRelease()
 			s.runs.Release(lease)
 			writeUpstreamError(w, resp.StatusCode, errorBody)
 			return
@@ -492,6 +506,7 @@ func (s *Server) proxyChatRequest(
 			s.logger.Printf("%s: rate limited by upstream, cooling down for %s", lease.pool.name, cooldown.Round(time.Second))
 			s.runs.Cooldown(lease, cooldown, fmt.Sprintf("rate limited by upstream (cooldown %s)", cooldown.Round(time.Second)))
 			lease.pool.invalidateSession("rate limited by upstream")
+			slotRelease()
 			s.runs.Release(lease)
 			recordUpstreamError(resp.StatusCode, errorBody)
 			continue
@@ -500,6 +515,7 @@ func (s *Server) proxyChatRequest(
 		// Any other upstream failure counts toward the per-pool circuit breaker.
 		s.runs.ReportFailure(lease, fmt.Sprintf("upstream status %d", resp.StatusCode))
 
+		slotRelease()
 		s.runs.Release(lease)
 		s.logger.Printf("[%s] upstream error response: %s", lease.pool.name, string(errorBody))
 		writeUpstreamError(w, resp.StatusCode, errorBody)
