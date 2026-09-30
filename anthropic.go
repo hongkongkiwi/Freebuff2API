@@ -621,7 +621,22 @@ func writeClaudeSuccessResponse(w http.ResponseWriter, resp *http.Response, requ
 	if stream {
 		return writeClaudeStreamingResponse(w, resp, requestedModel)
 	}
-	return writeClaudeNonStreamResponse(w, resp)
+	final, err := reassembleOpenAIStreamResponse(resp.Body, false)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(final)
+	if err != nil {
+		return err
+	}
+	converted, err := convertOpenAINonStreamResponseToClaude(body)
+	if err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	_, err = w.Write(converted)
+	return err
 }
 
 func writeClaudeNonStreamResponse(w http.ResponseWriter, resp *http.Response) error {
@@ -645,7 +660,6 @@ func writeClaudeStreamingResponse(w http.ResponseWriter, resp *http.Response, re
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(resp.StatusCode)
 
 	flusher, _ := w.(http.Flusher)
 	reader := bufio.NewReader(resp.Body)
@@ -657,26 +671,46 @@ func writeClaudeStreamingResponse(w http.ResponseWriter, resp *http.Response, re
 		ToolBlockIndexes:    make(map[int]int),
 	}
 
+	// Headers are committed only when the first events are written so a fully
+	// blank upstream stream can still be retried with a fresh session.
+	committed := false
+	commitHeader := func() {
+		if !committed {
+			w.WriteHeader(resp.StatusCode)
+			committed = true
+		}
+	}
+
 	sawDone := false
+	payloadCount := 0
+	var streamErr error
+
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
 			trimmed := bytes.TrimSpace(line)
 			if len(trimmed) > 0 && !bytes.HasPrefix(trimmed, []byte(":")) && bytes.HasPrefix(trimmed, []byte("data:")) {
 				payload := bytes.TrimSpace(trimmed[5:])
-				if bytes.Equal(payload, []byte("[DONE]")) {
-					sawDone = true
-				}
+				if len(payload) > 0 {
+					payloadCount++
+					if bytes.Equal(payload, []byte("[DONE]")) {
+						sawDone = true
+					}
 
-				events, convErr := convertOpenAIStreamPayloadToClaudeEvents(payload, state)
-				if convErr != nil {
-					return convErr
-				}
-				if err := writeClaudeSSEEvents(w, events); err != nil {
-					return err
-				}
-				if flusher != nil && len(events) > 0 {
-					flusher.Flush()
+					events, convErr := convertOpenAIStreamPayloadToClaudeEvents(payload, state)
+					if convErr != nil {
+						streamErr = convErr
+						break
+					}
+					if len(events) > 0 {
+						commitHeader()
+						if err := writeClaudeSSEEvents(w, events); err != nil {
+							return err
+						}
+						if flusher != nil {
+							flusher.Flush()
+						}
+					}
 				}
 			}
 		}
@@ -685,24 +719,34 @@ func writeClaudeStreamingResponse(w http.ResponseWriter, resp *http.Response, re
 			if err == io.EOF {
 				break
 			}
-			return err
+			streamErr = err
+			break
 		}
 	}
 
+	// Always close the stream out: a truncated upstream body or mid-read error
+	// must still leave the client with a terminal event sequence.
 	if !sawDone {
-		events, err := finalizeClaudeStream(state)
-		if err != nil {
-			return err
-		}
-		if err := writeClaudeSSEEvents(w, events); err != nil {
-			return err
-		}
-		if flusher != nil && len(events) > 0 {
-			flusher.Flush()
+		events, finalizeErr := finalizeClaudeStream(state)
+		if finalizeErr != nil {
+			if streamErr == nil {
+				streamErr = finalizeErr
+			}
+		} else if len(events) > 0 {
+			commitHeader()
+			if err := writeClaudeSSEEvents(w, events); err != nil {
+				return err
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
 		}
 	}
 
-	return nil
+	if payloadCount == 0 && !committed && streamErr == nil {
+		return errBlankUpstreamStream
+	}
+	return streamErr
 }
 
 type openAIChatCompletion struct {
@@ -795,17 +839,26 @@ func convertOpenAINonStreamResponseToClaude(body []byte) ([]byte, error) {
 			message["content"] = append(message["content"].([]any), block)
 		}
 		for _, toolCall := range choice.Message.ToolCalls {
+			name := fromWireToolName(toolCall.Function.Name)
+			if isSignatureToolName(name) {
+				continue
+			}
 			hasToolCall = true
 			message["content"] = append(message["content"].([]any), map[string]any{
 				"type":  "tool_use",
 				"id":    sanitizeClaudeToolID(toolCall.ID),
-				"name":  toolCall.Function.Name,
+				"name":  name,
 				"input": parseJSONObject(toolCall.Function.Arguments),
 			})
 		}
 		if choice.FinishReason != "" {
 			message["stop_reason"] = mapOpenAIFinishReasonToClaude(choice.FinishReason)
 		}
+	}
+
+	// Claude clients reject messages with an empty content array.
+	if contentBlocks, ok := message["content"].([]any); ok && len(contentBlocks) == 0 {
+		message["content"] = append(contentBlocks, map[string]any{"type": "text", "text": ""})
 	}
 
 	if response.Usage != nil {
@@ -969,6 +1022,10 @@ func convertOpenAIStreamPayloadToClaudeEvents(payload []byte, state *claudeStrea
 		}
 
 		for _, toolCall := range choice.Delta.ToolCalls {
+			name := fromWireToolName(toolCall.Function.Name)
+			if isSignatureToolName(name) {
+				continue
+			}
 			state.SawToolCall = true
 			stopThinkingContentBlock(state, &events)
 			stopTextContentBlock(state, &events)
@@ -982,8 +1039,8 @@ func convertOpenAIStreamPayloadToClaudeEvents(payload []byte, state *claudeStrea
 			if strings.TrimSpace(toolCall.ID) != "" {
 				accumulator.ID = toolCall.ID
 			}
-			if strings.TrimSpace(toolCall.Function.Name) != "" {
-				accumulator.Name = toolCall.Function.Name
+			if name != "" {
+				accumulator.Name = name
 			}
 			if toolCall.Function.Arguments != "" {
 				accumulator.Arguments.WriteString(toolCall.Function.Arguments)
@@ -1043,6 +1100,22 @@ func finalizeClaudeStream(state *claudeStreamState) ([]claudeSSEEvent, error) {
 func appendClaudeFinalContentEvents(events []claudeSSEEvent, state *claudeStreamState) ([]claudeSSEEvent, error) {
 	if state.ContentBlocksStopped {
 		return events, nil
+	}
+
+	// Claude clients reject messages with zero content blocks; streams that
+	// produced no output at all still get an empty text block.
+	if !state.TextContentStarted && !state.ThinkingStarted && len(state.ToolBlocks) == 0 {
+		index := nextClaudeBlockIndex(state, &state.TextContentBlockIdx)
+		startPayload, err := json.Marshal(map[string]any{
+			"type":          "content_block_start",
+			"index":         index,
+			"content_block": map[string]any{"type": "text", "text": ""},
+		})
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, claudeSSEEvent{Name: "content_block_start", Payload: startPayload})
+		state.TextContentStarted = true
 	}
 
 	stopThinkingContentBlock(state, &events)
@@ -1256,10 +1329,14 @@ func convertOpenAIContentToClaudeBlocks(raw json.RawMessage) []any {
 					continue
 				}
 				function := mapValue(toolCall["function"])
+				name := fromWireToolName(stringValue(function["name"]))
+				if isSignatureToolName(name) {
+					continue
+				}
 				blocks = append(blocks, map[string]any{
 					"type":  "tool_use",
 					"id":    sanitizeClaudeToolID(stringValue(toolCall["id"])),
-					"name":  stringValue(function["name"]),
+					"name":  name,
 					"input": parseJSONObject(stringValue(function["arguments"])),
 				})
 			}

@@ -14,26 +14,32 @@ import (
 )
 
 type Config struct {
-	ListenAddr       string
-	UpstreamBaseURL  string
-	AuthTokens       []string
-	RotationInterval time.Duration
-	RequestTimeout   time.Duration
-	UserAgent        string
-	APIKeys          []string
-	HTTPProxy        string
-	MaxRequestBodyMB int
+	ListenAddr          string
+	UpstreamBaseURL     string
+	AuthTokens          []string
+	RotationInterval    time.Duration
+	RequestTimeout      time.Duration
+	UserAgent           string
+	APIKeys             []string
+	HTTPProxy           string
+	MaxRequestBodyMB    int
+	ForceUpstreamStream bool
+	ToolCamouflage      bool
+	HarnessRewrites     bool
 }
 
 type rawConfig struct {
-	ListenAddr       string   `json:"LISTEN_ADDR"`
-	UpstreamBaseURL  string   `json:"UPSTREAM_BASE_URL"`
-	AuthTokens       []string `json:"AUTH_TOKENS"`
-	RotationInterval string   `json:"ROTATION_INTERVAL"`
-	RequestTimeout   string   `json:"REQUEST_TIMEOUT"`
-	APIKeys          []string `json:"API_KEYS"`
-	HTTPProxy        string   `json:"HTTP_PROXY"`
-	MaxRequestBodyMB int      `json:"MAX_REQUEST_BODY_MB"`
+	ListenAddr          string   `json:"LISTEN_ADDR"`
+	UpstreamBaseURL     string   `json:"UPSTREAM_BASE_URL"`
+	AuthTokens          []string `json:"AUTH_TOKENS"`
+	RotationInterval    string   `json:"ROTATION_INTERVAL"`
+	RequestTimeout      string   `json:"REQUEST_TIMEOUT"`
+	APIKeys             []string `json:"API_KEYS"`
+	HTTPProxy           string   `json:"HTTP_PROXY"`
+	MaxRequestBodyMB    int      `json:"MAX_REQUEST_BODY_MB"`
+	ForceUpstreamStream bool     `json:"FORCE_UPSTREAM_STREAM"`
+	ToolCamouflage      bool     `json:"TOOL_CAMOUFLAGE"`
+	HarnessRewrites     bool     `json:"HARNESS_REWRITES"`
 }
 
 func loadConfig(configPath string) (Config, error) {
@@ -50,6 +56,9 @@ func loadConfig(configPath string) (Config, error) {
 	overrideCSV(&cfg.APIKeys, "API_KEYS")
 	overrideString(&cfg.HTTPProxy, "HTTP_PROXY")
 	overrideInt(&cfg.MaxRequestBodyMB, "MAX_REQUEST_BODY_MB")
+	overrideBool(&cfg.ForceUpstreamStream, "FORCE_UPSTREAM_STREAM")
+	overrideBool(&cfg.ToolCamouflage, "TOOL_CAMOUFLAGE")
+	overrideBool(&cfg.HarnessRewrites, "HARNESS_REWRITES")
 
 	rotationInterval, err := time.ParseDuration(strings.TrimSpace(cfg.RotationInterval))
 	if err != nil {
@@ -62,15 +71,18 @@ func loadConfig(configPath string) (Config, error) {
 	}
 
 	finalCfg := Config{
-		ListenAddr:       strings.TrimSpace(cfg.ListenAddr),
-		UpstreamBaseURL:  normalizeUpstreamBaseURL(cfg.UpstreamBaseURL),
-		AuthTokens:       dedupeStrings(cfg.AuthTokens),
-		RotationInterval: rotationInterval,
-		RequestTimeout:   requestTimeout,
-		UserAgent:        generateUserAgent(),
-		APIKeys:          dedupeStrings(cfg.APIKeys),
-		HTTPProxy:        strings.TrimSpace(cfg.HTTPProxy),
-		MaxRequestBodyMB: cfg.MaxRequestBodyMB,
+		ListenAddr:          strings.TrimSpace(cfg.ListenAddr),
+		UpstreamBaseURL:     normalizeUpstreamBaseURL(cfg.UpstreamBaseURL),
+		AuthTokens:          dedupeStrings(cfg.AuthTokens),
+		RotationInterval:    rotationInterval,
+		RequestTimeout:      requestTimeout,
+		UserAgent:           generateUserAgent(),
+		APIKeys:             dedupeStrings(cfg.APIKeys),
+		HTTPProxy:           strings.TrimSpace(cfg.HTTPProxy),
+		MaxRequestBodyMB:    cfg.MaxRequestBodyMB,
+		ForceUpstreamStream: cfg.ForceUpstreamStream,
+		ToolCamouflage:      cfg.ToolCamouflage,
+		HarnessRewrites:     cfg.HarnessRewrites,
 	}
 
 	switch {
@@ -109,10 +121,13 @@ func normalizeUpstreamBaseURL(raw string) string {
 
 func loadRawConfig(configPath string) (rawConfig, error) {
 	cfg := rawConfig{
-		ListenAddr:       ":8080",
-		UpstreamBaseURL:  "https://www.codebuff.com",
-		RotationInterval: "6h",
-		RequestTimeout:   "15m",
+		ListenAddr:          ":8080",
+		UpstreamBaseURL:     "https://www.codebuff.com",
+		RotationInterval:    "6h",
+		RequestTimeout:      "15m",
+		ForceUpstreamStream: true,
+		ToolCamouflage:      true,
+		HarnessRewrites:     true,
 	}
 
 	if configPath != "" {
@@ -145,6 +160,18 @@ func overrideInt(target *int, envName string) {
 	}
 	parsed, err := strconv.Atoi(value)
 	if err != nil || parsed < 0 {
+		return
+	}
+	*target = parsed
+}
+
+func overrideBool(target *bool, envName string) {
+	value := strings.TrimSpace(os.Getenv(envName))
+	if value == "" {
+		return
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
 		return
 	}
 	*target = parsed

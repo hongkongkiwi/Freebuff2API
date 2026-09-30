@@ -20,15 +20,6 @@ import (
 // MAX_REQUEST_BODY_MB is configured.
 const defaultMaxRequestBodyBytes = 32 << 20
 
-// passthroughHeaders is the allowlist of upstream response headers copied to
-// clients. Everything else (set-cookie, server, cf-*, ...) is dropped.
-var passthroughHeaders = map[string]bool{
-	"Content-Type":  true,
-	"Cache-Control": true,
-	"Retry-After":   true,
-	"X-Request-Id":  true,
-}
-
 // defaultUpstreamStop is the stop sentinel the free-tier backend expects when
 // the client did not provide one (a JSON string containing double quotes).
 const defaultUpstreamStop = "\"cb_easp\""
@@ -277,6 +268,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	clientStream := boolValue(payload["stream"])
+
 	s.proxyChatRequest(
 		w,
 		r,
@@ -286,7 +279,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		"server_error",
 		writeOpenAIError,
 		writePassthroughError,
-		writeOpenAISuccessResponse,
+		func(w http.ResponseWriter, resp *http.Response) error {
+			return s.writeOpenAISuccess(w, resp, clientStream)
+		},
 	)
 }
 
@@ -324,7 +319,7 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 		},
 		writeClaudePassthroughError,
 		func(w http.ResponseWriter, resp *http.Response) error {
-			return writeClaudeSuccessResponse(w, resp, requestedModel, stream)
+			return s.writeClaudeSuccess(w, resp, requestedModel, stream)
 		},
 	)
 }
@@ -451,12 +446,21 @@ func (s *Server) proxyChatRequest(
 		}
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			defer resp.Body.Close()
 			s.runs.ReportSuccess(lease)
-			if err := writeSuccess(w, resp); err != nil && !errors.Is(err, context.Canceled) {
-				s.logger.Printf("[%s] proxy response copy failed: %v", lease.pool.name, err)
+			writeErr := writeSuccess(w, resp)
+			if closeErr := resp.Body.Close(); closeErr != nil {
+				s.logger.Printf("[%s] upstream body close failed: %v", lease.pool.name, closeErr)
 			}
-			s.logger.Printf("[%s] Request completed successfully in %v (status: %d)", lease.pool.name, time.Since(startTime).Round(time.Millisecond), resp.StatusCode)
+			if errors.Is(writeErr, errBlankUpstreamStream) && attempt < maxProxyAttempts-1 {
+				s.logger.Printf("[%s] upstream returned a blank stream, refreshing session and retrying", lease.pool.name)
+				lease.pool.invalidateSession("blank upstream stream")
+				s.runs.Release(lease)
+				continue
+			}
+			if writeErr != nil && !errors.Is(writeErr, context.Canceled) {
+				s.logger.Printf("[%s] proxy response copy failed: %v", lease.pool.name, writeErr)
+			}
+			s.logger.Printf("[%s] Request completed in %v (status: %d)", lease.pool.name, time.Since(startTime).Round(time.Millisecond), resp.StatusCode)
 			s.runs.Release(lease)
 			return
 		}
@@ -505,10 +509,49 @@ func (s *Server) proxyChatRequest(
 	surfaceUpstreamError()
 }
 
-func writeOpenAISuccessResponse(w http.ResponseWriter, resp *http.Response) error {
-	copyHeaders(w.Header(), resp.Header)
+// writeOpenAISuccess serves a chat completion: streaming clients get the SSE
+// relay (with camouflage stripped per chunk), non-streaming clients get a
+// response reassembled from the forced upstream stream.
+func (s *Server) writeOpenAISuccess(w http.ResponseWriter, resp *http.Response, clientStream bool) error {
+	if clientStream {
+		return writeOpenAIStreamingResponse(w, resp, s.cfg.ToolCamouflage)
+	}
+	final, err := reassembleOpenAIStreamResponse(resp.Body, s.cfg.ToolCamouflage)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(final)
+	if err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
-	return copyResponseBody(w, resp.Body)
+	_, err = w.Write(body)
+	return err
+}
+
+// writeClaudeSuccess serves a Claude Messages response converted from the
+// forced upstream OpenAI stream.
+func (s *Server) writeClaudeSuccess(w http.ResponseWriter, resp *http.Response, requestedModel string, clientStream bool) error {
+	if clientStream {
+		return writeClaudeStreamingResponse(w, resp, requestedModel)
+	}
+	final, err := reassembleOpenAIStreamResponse(resp.Body, false)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(final)
+	if err != nil {
+		return err
+	}
+	converted, err := convertOpenAINonStreamResponseToClaude(body)
+	if err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	_, err = w.Write(converted)
+	return err
 }
 
 func (s *Server) injectUpstreamMetadata(pool *tokenPool, payload map[string]any, requestedModel, runID, sessionInstanceID string) ([]byte, error) {
@@ -527,6 +570,16 @@ func (s *Server) injectUpstreamMetadata(pool *tokenPool, payload map[string]any,
 		cloned["stop"] = []any{defaultUpstreamStop}
 	}
 	cloned["provider"] = map[string]any{"data_collection": "deny"}
+
+	if s.cfg.HarnessRewrites {
+		rewriteHarnessPrompts(cloned)
+	}
+	if s.cfg.ForceUpstreamStream {
+		forceUpstreamStreaming(cloned)
+	}
+	if tools, ok := cloned["tools"].([]any); ok && len(tools) > 0 && s.cfg.ToolCamouflage {
+		camouflageToolsForUpstream(cloned)
+	}
 
 	metadata, ok := cloned["codebuff_metadata"].(map[string]any)
 	if !ok || metadata == nil {
@@ -847,40 +900,6 @@ func cloneSlice(input []any) []any {
 		}
 	}
 	return output
-}
-
-func copyHeaders(dst, src http.Header) {
-	for key, values := range src {
-		if !passthroughHeaders[http.CanonicalHeaderKey(key)] {
-			continue
-		}
-		dst.Del(key)
-		for _, value := range values {
-			dst.Add(key, value)
-		}
-	}
-}
-
-func copyResponseBody(w http.ResponseWriter, body io.Reader) error {
-	flusher, _ := w.(http.Flusher)
-	buffer := make([]byte, 32*1024)
-	for {
-		n, err := body.Read(buffer)
-		if n > 0 {
-			if _, writeErr := w.Write(buffer[:n]); writeErr != nil {
-				return writeErr
-			}
-			if flusher != nil {
-				flusher.Flush()
-			}
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
-		}
-	}
 }
 
 func isRunInvalid(statusCode int, body []byte) bool {
